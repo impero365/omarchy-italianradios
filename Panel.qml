@@ -9,7 +9,7 @@ import "Model.js" as Model
 
 // Bar icon that opens a filterable list of Italian web radios. The directory
 // is fetched only when the panel opens and the saved copy is missing or older
-// than a day. The left column is the player and favourites. The right column
+// than a day. The left column is the player and favorites. The right column
 // is the filters and the station list. A click asks radio-player to play the
 // stream in one sandboxed mpv. The player pauses and resumes that stream.
 Panel {
@@ -39,13 +39,20 @@ Panel {
       base = state.replace(/\/+$/, "")
     return base + "/mattia.radio"
   }
-  readonly property string favouritesPath: stateDir !== "" ? stateDir + "/favourites.json" : ""
+  readonly property string favoritesPath: stateDir !== "" ? stateDir + "/favorites.json" : ""
   readonly property string playerPath: {
     var text = Qt.resolvedUrl("radio-player").toString()
     if (text.indexOf("file://") !== 0) return ""
     var path = decodeURIComponent(text.slice(7))
     if (path.charAt(0) !== "/" || path.indexOf("..") !== -1 || /[\u0000-\u001F]/.test(path)) return ""
     return path
+  }
+  // radio-player rewrites this on every command. A reloaded bar icon has no
+  // memory of the station, so it reads the file instead of waiting for a click.
+  readonly property string playbackPath: {
+    var runtime = String(Quickshell.env("XDG_RUNTIME_DIR") || "")
+    if (runtime.charAt(0) !== "/" || runtime.indexOf("..") !== -1 || /[\u0000-\u001F\s]/.test(runtime)) return ""
+    return runtime.replace(/\/+$/, "") + "/mattia.radio/playback.json"
   }
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.45)
@@ -58,17 +65,37 @@ Panel {
   property bool cacheReady: false
   property string query: ""
   property string regionQuery: ""
-  property var favourites: []
-  property bool favouritesReady: false
-  property bool favouritesDirty: false
-  property string pendingFavourites: ""
-  readonly property var favouriteMark: {
+  property var favorites: []
+  property bool favoritesReady: false
+  property bool favoritesDirty: false
+  property string pendingFavorites: ""
+  readonly property var favoriteMark: {
     var mark = {}
-    var rows = favourites
+    var rows = favorites
     for (var i = 0; i < rows.length; i++) mark[rows[i].id] = true
     return mark
   }
-  readonly property var shownFavourites: Model.resolveFavourites(favourites, stations)
+  readonly property var shownFavorites: Model.resolveFavorites(favorites, stations)
+  // Each list has one row height, measured from its own longest name and
+  // region at that list's width. Text wraps onto full lines and is not cut off.
+  readonly property real entryActionSize: Math.round(Math.max(Style.space(22), Style.font.icon + Style.spacing.sm * 2)) | 1
+  function entryTextWidth(listWidth) {
+    var chrome = Style.space(8) + Style.space(28) + Style.space(8) + entryActionSize + Style.space(4)
+    var width = listWidth > 0 ? listWidth - chrome : Style.space(320) - chrome
+    return Math.max(Style.space(40), width)
+  }
+  readonly property string favoriteNameSample: {
+    var sample = Model.longestField(favorites, [], "name")
+    return sample !== "" ? sample : " "
+  }
+  readonly property string favoriteRegionSample: Model.longestField(favorites, [], "region")
+  readonly property string stationNameSample: {
+    var sample = Model.longestField(stations, [], "name")
+    return sample !== "" ? sample : " "
+  }
+  readonly property string stationRegionSample: Model.longestField(stations, [], "region")
+  readonly property real favoriteEntryHeight: Math.max(favoriteProbe.implicitHeight, Style.space(28), entryActionSize) + Style.space(8)
+  readonly property real stationEntryHeight: Math.max(stationProbe.implicitHeight, Style.space(28), entryActionSize) + Style.space(8)
   property int selectedIndex: 0
   property bool wheelScrolling: false
   property real lastCursorMs: 0
@@ -153,28 +180,28 @@ Panel {
     loadFailed = stations.length === 0
   }
 
-  function isFavourite(id) {
-    return favouriteMark[id] === true
+  function isFavorite(id) {
+    return favoriteMark[id] === true
   }
 
-  function toggleFavourite(station) {
-    favouritesDirty = true
-    favourites = Model.toggleFavourite(favourites, station)
-    saveFavourites()
+  function toggleFavorite(station) {
+    favoritesDirty = true
+    favorites = Model.toggleFavorite(favorites, station)
+    saveFavorites()
   }
 
-  function saveFavourites() {
-    if (favouritesPath === "") return
-    pendingFavourites = Model.favouritesPayload(favourites)
+  function saveFavorites() {
+    if (favoritesPath === "") return
+    pendingFavorites = Model.favoritesPayload(favorites)
     if (!stateMkdir.running) stateMkdir.running = true
   }
 
-  function syncFavouriteSnapshots() {
-    if (!favouritesReady || favourites.length === 0) return
-    var next = Model.resolveFavourites(favourites, stations)
-    if (Model.favouritesPayload(next) === Model.favouritesPayload(favourites)) return
-    favourites = next
-    saveFavourites()
+  function syncFavoriteSnapshots() {
+    if (!favoritesReady || favorites.length === 0) return
+    var next = Model.resolveFavorites(favorites, stations)
+    if (Model.favoritesPayload(next) === Model.favoritesPayload(favorites)) return
+    favorites = next
+    saveFavorites()
   }
 
   function saveCache() {
@@ -381,12 +408,13 @@ Panel {
   onFilteredChanged: {
     if (selectedIndex >= filtered.length) selectedIndex = filtered.length > 0 ? 0 : -1
   }
-  onStationsChanged: syncFavouriteSnapshots()
+  onStationsChanged: syncFavoriteSnapshots()
+  Component.onCompleted: refreshStatus()
   onOpenedChanged: {
     if (!opened) return
     panel.ensureContent()
     refreshIfStale()
-    Qt.callLater(refreshStatus)
+    refreshStatus()
     Qt.callLater(focusFilter)
   }
 
@@ -407,18 +435,27 @@ Panel {
   }
 
   FileView {
-    id: favouritesFile
-    path: root.favouritesPath
+    id: playbackFile
+    path: root.playbackPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.applyPlayerStatus(text(), false)
+    onFileChanged: reload()
+  }
+
+  FileView {
+    id: favoritesFile
+    path: root.favoritesPath
     printErrors: false
     watchChanges: false
     onLoaded: {
-      if (!root.favouritesDirty) root.favourites = Model.parseFavourites(text())
-      root.favouritesReady = true
-      root.syncFavouriteSnapshots()
+      if (!root.favoritesDirty) root.favorites = Model.parseFavorites(text())
+      root.favoritesReady = true
+      root.syncFavoriteSnapshots()
     }
     onLoadFailed: {
-      root.favouritesReady = true
-      root.syncFavouriteSnapshots()
+      root.favoritesReady = true
+      root.syncFavoriteSnapshots()
     }
   }
 
@@ -426,9 +463,9 @@ Panel {
     id: stateMkdir
     command: ["mkdir", "-p", root.stateDir]
     onExited: function(code) {
-      if (code !== 0 || root.pendingFavourites === "" || root.favouritesPath === "") return
-      favouritesFile.setText(root.pendingFavourites)
-      root.pendingFavourites = ""
+      if (code !== 0 || root.pendingFavorites === "" || root.favoritesPath === "") return
+      favoritesFile.setText(root.pendingFavorites)
+      root.pendingFavorites = ""
     }
   }
 
@@ -483,9 +520,13 @@ Panel {
     }
     onExited: function(code) {
       var queued = playerAction.queued
+      var failed = code !== 0
       playerAction.queued = null
-      root.applyPlayerStatus(playerAction.output, code !== 0)
-      if (queued) root.runPlayer(queued)
+      // The collector writes the output after this signal. Apply it on the next turn.
+      Qt.callLater(function() {
+        root.applyPlayerStatus(playerAction.output, failed)
+        if (queued) root.runPlayer(queued)
+      })
     }
   }
 
@@ -494,10 +535,17 @@ Panel {
     property string output: ""
     stdout: StdioCollector {
       waitForEnd: true
-      onStreamFinished: statusProc.output = text
+      onStreamFinished: {
+        statusProc.output = text
+        if (!playerAction.running) root.applyPlayerStatus(text, false)
+      }
     }
     onExited: function(code) {
-      if (!playerAction.running) root.applyPlayerStatus(statusProc.output, code !== 0)
+      var failed = code !== 0
+      Qt.callLater(function() {
+        if (!playerAction.running && (failed || statusProc.output !== ""))
+          root.applyPlayerStatus(statusProc.output, failed)
+      })
     }
   }
 
@@ -562,6 +610,58 @@ Panel {
     active: root.playerActive && !root.paused
     activeColor: "#f5c518"
     onPressed: root.toggle()
+  }
+
+  Column {
+    id: favoriteProbe
+    visible: false
+    width: root.entryTextWidth(favoriteList.width)
+    spacing: Style.space(1)
+
+    Text {
+      width: favoriteProbe.width
+      textFormat: Text.PlainText
+      wrapMode: Text.Wrap
+      text: root.favoriteNameSample
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      width: favoriteProbe.width
+      visible: root.favoriteRegionSample !== ""
+      textFormat: Text.PlainText
+      wrapMode: Text.Wrap
+      text: root.favoriteRegionSample
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+  }
+
+  Column {
+    id: stationProbe
+    visible: false
+    width: root.entryTextWidth(stationList.width)
+    spacing: Style.space(1)
+
+    Text {
+      width: stationProbe.width
+      textFormat: Text.PlainText
+      wrapMode: Text.Wrap
+      text: root.stationNameSample
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+    }
+
+    Text {
+      width: stationProbe.width
+      visible: root.stationRegionSample !== ""
+      textFormat: Text.PlainText
+      wrapMode: Text.Wrap
+      text: root.stationRegionSample
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
   }
 
   KeyboardPanel {
@@ -719,7 +819,7 @@ Panel {
         Text {
           width: parent.width
           textFormat: Text.PlainText
-          text: strings.t("panel.favourites")
+          text: strings.t("panel.favorites")
           color: root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -729,9 +829,9 @@ Panel {
 
         Text {
           width: parent.width
-          visible: root.favourites.length === 0
+          visible: root.favorites.length === 0
           textFormat: Text.PlainText
-          text: strings.t("panel.favouritesEmpty")
+          text: strings.t("panel.favoritesEmpty")
           wrapMode: Text.WordWrap
           maximumLineCount: 2
           elide: Text.ElideRight
@@ -741,22 +841,23 @@ Panel {
         }
 
         ListView {
-          id: favouriteList
+          id: favoriteList
           width: parent.width
-          visible: root.shownFavourites.length > 0
+          visible: root.shownFavorites.length > 0
           height: visible ? Math.max(0, favColumn.height - y) : 0
           clip: true
           boundsBehavior: Flickable.StopAtBounds
           spacing: Style.space(2)
-          model: root.shownFavourites
+          model: root.shownFavorites
           ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
           delegate: CursorSurface {
             id: savedRow
             required property var modelData
             required property int index
-            width: favouriteList.width
-            implicitHeight: savedBody.implicitHeight + Style.space(8)
+            width: favoriteList.width
+            height: root.favoriteEntryHeight
+            implicitHeight: root.favoriteEntryHeight
             hasCursor: false
             current: modelData.id === root.playingId
             foreground: root.foreground
@@ -822,22 +923,23 @@ Panel {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
                   text: savedRow.modelData.name
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
-                  elide: Text.ElideRight
                 }
 
                 Text {
                   width: parent.width
-                  visible: savedRow.modelData.region !== ""
                   textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  visible: savedRow.modelData.region !== ""
+                  height: visible ? implicitHeight : 0
                   text: savedRow.modelData.region
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
                 }
               }
 
@@ -847,10 +949,10 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 z: 1
                 iconText: root.starOnGlyph
-                tooltipText: strings.t("panel.favouriteRemove")
+                tooltipText: strings.t("panel.favoriteRemove")
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                onClicked: root.toggleFavourite(savedRow.modelData)
+                onClicked: root.toggleFavorite(savedRow.modelData)
               }
             }
           }
@@ -922,7 +1024,8 @@ Panel {
             required property var modelData
             required property int index
             width: stationList.width
-            implicitHeight: rowBody.implicitHeight + Style.space(8)
+            height: root.stationEntryHeight
+            implicitHeight: root.stationEntryHeight
             hasCursor: root.selectedIndex === index
             current: modelData.id === root.playingId
             foreground: root.foreground
@@ -994,23 +1097,23 @@ Panel {
                 Text {
                   width: parent.width
                   textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
                   text: row.modelData.name
                   color: root.foreground
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.body
-                  elide: Text.ElideRight
                 }
 
                 Text {
                   width: parent.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
                   visible: row.modelData.region !== ""
                   height: visible ? implicitHeight : 0
-                  textFormat: Text.PlainText
                   text: row.modelData.region
                   color: root.dim
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
-                  elide: Text.ElideRight
                 }
               }
 
@@ -1019,11 +1122,11 @@ Panel {
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
                 z: 1
-                iconText: root.isFavourite(row.modelData.id) ? root.starOnGlyph : root.starOffGlyph
-                tooltipText: root.isFavourite(row.modelData.id) ? strings.t("panel.favouriteRemove") : strings.t("panel.favouriteAdd")
+                iconText: root.isFavorite(row.modelData.id) ? root.starOnGlyph : root.starOffGlyph
+                tooltipText: root.isFavorite(row.modelData.id) ? strings.t("panel.favoriteRemove") : strings.t("panel.favoriteAdd")
                 foreground: root.foreground
                 fontFamily: root.fontFamily
-                onClicked: root.toggleFavourite(row.modelData)
+                onClicked: root.toggleFavorite(row.modelData)
               }
             }
           }

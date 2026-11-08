@@ -10,7 +10,7 @@ var NAME_LIMIT = 80
 var REGION_LIMIT = 48
 var URL_LIMIT = 500
 var CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
-var FAVOURITE_CAP = 100
+var FAVORITE_CAP = 100
 
 var DIRECTORY_HOSTS = [
   "https://de1.api.radio-browser.info",
@@ -187,7 +187,7 @@ function cacheIsStale(fetchedAt, now) {
   return age > CACHE_MAX_AGE_MS
 }
 
-function parseFavourites(raw) {
+function parseFavorites(raw) {
   var text = String(raw || "")
   if (!text || text.length > BODY_LIMIT) return []
   var data
@@ -201,7 +201,7 @@ function parseFavourites(raw) {
   var out = []
   var seen = {}
   var scan = Math.min(items.length, SCAN_CAP)
-  for (var i = 0; i < scan && out.length < FAVOURITE_CAP; i++) {
+  for (var i = 0; i < scan && out.length < FAVORITE_CAP; i++) {
     var row = acceptStation(items[i])
     if (!row || seen[row.id]) continue
     seen[row.id] = true
@@ -210,26 +210,26 @@ function parseFavourites(raw) {
   return out
 }
 
-function favouritesPayload(list) {
-  return JSON.stringify({ stations: parseFavourites(JSON.stringify({ stations: list || [] })) })
+function favoritesPayload(list) {
+  return JSON.stringify({ stations: parseFavorites(JSON.stringify({ stations: list || [] })) })
 }
 
 // Saved order is the user's order. A station still in the directory uses that
 // newer row; a station the directory dropped keeps its saved snapshot.
-function resolveFavourites(saved, directory) {
+function resolveFavorites(saved, directory) {
   var byId = {}
   var dir = directory || []
   for (var i = 0; i < dir.length; i++) {
     if (dir[i] && dir[i].id) byId[dir[i].id] = dir[i]
   }
-  var rows = parseFavourites(JSON.stringify({ stations: saved || [] }))
+  var rows = parseFavorites(JSON.stringify({ stations: saved || [] }))
   var out = []
   for (var j = 0; j < rows.length; j++) out.push(byId[rows[j].id] || rows[j])
   return out
 }
 
-function toggleFavourite(saved, station) {
-  var rows = parseFavourites(JSON.stringify({ stations: saved || [] }))
+function toggleFavorite(saved, station) {
+  var rows = parseFavorites(JSON.stringify({ stations: saved || [] }))
   var row = acceptStation(station)
   if (!row) return rows
   var next = []
@@ -243,7 +243,7 @@ function toggleFavourite(saved, station) {
   }
   if (!found) {
     next.unshift(row)
-    if (next.length > FAVOURITE_CAP) next.length = FAVOURITE_CAP
+    if (next.length > FAVORITE_CAP) next.length = FAVORITE_CAP
   }
   return next
 }
@@ -315,6 +315,21 @@ function parsePlayerStatus(raw) {
   return null
 }
 
+function longestField(left, right, field) {
+  var best = ""
+  function scan(rows) {
+    if (!rows || !rows.length) return
+    for (var i = 0; i < rows.length; i++) {
+      var row = rows[i]
+      var value = row && row[field] != null ? String(row[field]) : ""
+      if (value.length > best.length) best = value
+    }
+  }
+  scan(left)
+  scan(right)
+  return best
+}
+
 function tooltipText(playingName, idleLabel, playingLabel) {
   var name = plainName(playingName, NAME_LIMIT)
   if (!name) return String(idleLabel || "")
@@ -326,7 +341,7 @@ if (typeof module !== "undefined") {
     BODY_LIMIT: BODY_LIMIT,
     STATION_CAP: STATION_CAP,
     CACHE_MAX_AGE_MS: CACHE_MAX_AGE_MS,
-    FAVOURITE_CAP: FAVOURITE_CAP,
+    FAVORITE_CAP: FAVORITE_CAP,
     plainName: plainName,
     foldQuery: foldQuery,
     streamUrl: streamUrl,
@@ -336,13 +351,14 @@ if (typeof module !== "undefined") {
     cachePayload: cachePayload,
     cacheIsStale: cacheIsStale,
     filterStations: filterStations,
-    parseFavourites: parseFavourites,
-    favouritesPayload: favouritesPayload,
-    resolveFavourites: resolveFavourites,
-    toggleFavourite: toggleFavourite,
+    parseFavorites: parseFavorites,
+    favoritesPayload: favoritesPayload,
+    resolveFavorites: resolveFavorites,
+    toggleFavorite: toggleFavorite,
     directoryUrl: directoryUrl,
     fetchCommand: fetchCommand,
     parsePlayerStatus: parsePlayerStatus,
+    longestField: longestField,
     tooltipText: tooltipText
   }
 }

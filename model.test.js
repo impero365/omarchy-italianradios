@@ -122,6 +122,15 @@ test("player status accepts one status object and drops anything else", function
   assert.equal(Model.parsePlayerStatus(""), null)
 })
 
+test("row height follows the longest name and region", function() {
+  var stations = [{ name: "Radio Capital", region: "Lazio" }, { name: "A", region: "" }]
+  var favorites = [{ name: "Free Radio Conselve", region: "Veneto" }]
+  assert.equal(Model.longestField(stations, favorites, "name"), "Free Radio Conselve")
+  assert.equal(Model.longestField(stations, favorites, "region"), "Veneto")
+  assert.equal(Model.longestField([], [], "name"), "")
+  assert.equal(Model.longestField(null, [{ name: "Only" }], "name"), "Only")
+})
+
 test("directory fetches are fixed argv, not a shell", function() {
   var fetch = Model.fetchCommand(0)
   assert.equal(fetch[0], "curl")
@@ -132,7 +141,7 @@ test("directory fetches are fixed argv, not a shell", function() {
   assert.equal(Model.fetchCommand("https://evil.example/").length, 0)
 })
 
-test("favourites keep the user's order and prefer a live directory row", function() {
+test("favorites keep the user's order and prefer a live directory row", function() {
   var liveId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
   var goneId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
   var saved = [
@@ -165,7 +174,7 @@ test("favourites keep the user's order and prefer a live directory row", functio
       icon: ""
     }
   ]
-  var stored = Model.parseFavourites(Model.favouritesPayload(saved))
+  var stored = Model.parseFavorites(Model.favoritesPayload(saved))
   assert.deepEqual(stored.map(function(row) { return row.id }), [goneId, liveId])
 
   var directory = Model.parseDirectory(JSON.stringify([
@@ -176,23 +185,23 @@ test("favourites keep the user's order and prefer a live directory row", functio
       url_resolved: "https://live.example.test/stream"
     })
   ]))
-  var resolved = Model.resolveFavourites(stored, directory)
+  var resolved = Model.resolveFavorites(stored, directory)
   assert.equal(resolved[0].stream, "https://old.example.test/gone")
   assert.equal(resolved[1].name, "Live Name")
   assert.equal(resolved[1].region, "Toscana")
   assert.equal(resolved[1].stream, "https://live.example.test/stream")
 
-  var removed = Model.toggleFavourite(stored, directory[0])
+  var removed = Model.toggleFavorite(stored, directory[0])
   assert.deepEqual(removed.map(function(row) { return row.id }), [goneId])
-  var added = Model.toggleFavourite(removed, directory[0])
+  var added = Model.toggleFavorite(removed, directory[0])
   assert.equal(added[0].id, liveId)
   assert.equal(added[0].name, "Live Name")
   assert.equal(added[0].stream, "https://live.example.test/stream")
   assert.equal(added.length, 2)
-  assert.equal(Model.toggleFavourite(added, { id: "nope", name: "X", stream: "file:///tmp/x" }).length, 2)
+  assert.equal(Model.toggleFavorite(added, { id: "nope", name: "X", stream: "file:///tmp/x" }).length, 2)
 
   var many = []
-  for (var n = 0; n < Model.FAVOURITE_CAP + 5; n++) {
+  for (var n = 0; n < Model.FAVORITE_CAP + 5; n++) {
     many.push({
       id: "dddddddd-dddd-dddd-dddd-" + String(100000000000 + n),
       name: "Station " + n,
@@ -201,8 +210,8 @@ test("favourites keep the user's order and prefer a live directory row", functio
       icon: ""
     })
   }
-  assert.equal(Model.parseFavourites(JSON.stringify({ stations: many })).length, Model.FAVOURITE_CAP)
-  assert.equal(Model.parseFavourites("not json").length, 0)
+  assert.equal(Model.parseFavorites(JSON.stringify({ stations: many })).length, Model.FAVORITE_CAP)
+  assert.equal(Model.parseFavorites("not json").length, 0)
 })
 
 test("a saved list is checked again and expires after a day", function() {

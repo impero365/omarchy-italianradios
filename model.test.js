@@ -102,31 +102,27 @@ test("region filter matches the stored region and combines with the name", funct
   assert.equal(Model.filterStations(list, "radio", "").length, 4)
 })
 
-test("playback and directory fetches are fixed argv, not a shell", function() {
-  var play = Model.playerCommand("https://example.test/stream", "Radio Capital --no-audio")
-  assert.equal(play[0], "mpv")
-  assert.equal(play.indexOf("sh"), -1)
-  assert.equal(play[play.length - 2], "--")
-  assert.equal(play[play.length - 1], "https://example.test/stream")
-  assert.equal(play.filter(function(arg) { return arg.indexOf("--force-media-title=") === 0 }).length, 1)
-  assert.equal(Model.playerCommand("file:///tmp/x", "Nope").length, 0)
-  assert.equal(Model.playerCommand("https://example.test/a; rm -rf /", "Nope").length, 0)
-  assert.equal(Model.playerCommand("https://example.test/stream", "Radio Capital").indexOf("--idle=yes"), -1)
-  var sock = "/run/user/1000/mattia.radio/mpv.sock"
-  var withSock = Model.playerCommand("https://example.test/stream", "Radio Capital", sock)
-  assert.ok(withSock.indexOf("--input-ipc-server=" + sock) !== -1)
-  assert.equal(withSock.indexOf("--idle=yes"), -1)
-  assert.equal(withSock[withSock.length - 1], "https://example.test/stream")
-  var unsafe = Model.playerCommand("https://example.test/stream", "Radio Capital", "/tmp/bad;rm")
-  assert.equal(unsafe.filter(function(arg) { return arg.indexOf("--input-ipc-server=") === 0 }).length, 0)
-  var pause = Model.pauseCommand(sock, true)
-  assert.equal(pause[0], "python3")
-  assert.equal(pause.indexOf("sh"), -1)
-  assert.equal(pause[pause.length - 2], sock)
-  assert.equal(pause[pause.length - 1], "1")
-  assert.equal(Model.pauseCommand("/tmp/not safe", false).length, 0)
-  assert.equal(Model.pauseCommand("/tmp/../sock", false).length, 0)
+test("player status accepts one status object and drops anything else", function() {
+  var status = Model.parsePlayerStatus(JSON.stringify({
+    running: true,
+    paused: false,
+    idle: false,
+    starting: false,
+    error: false,
+    id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    name: "Radio Capital",
+    reason: ""
+  }))
+  assert.equal(status.name, "Radio Capital")
+  assert.equal(status.running, true)
+  assert.equal(status.idle, false)
+  assert.equal(Model.parsePlayerStatus('{"running":true,"name":"<img>"}'), null)
+  assert.equal(Model.parsePlayerStatus('{"running":true,"reason":"shell"}'), null)
+  assert.equal(Model.parsePlayerStatus("not json"), null)
+  assert.equal(Model.parsePlayerStatus(""), null)
+})
 
+test("directory fetches are fixed argv, not a shell", function() {
   var fetch = Model.fetchCommand(0)
   assert.equal(fetch[0], "curl")
   assert.equal(fetch[fetch.length - 1], "https://de1.api.radio-browser.info/json/stations/search?countrycode=IT&hidebroken=true&order=name&limit=2500")

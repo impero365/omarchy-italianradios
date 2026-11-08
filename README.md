@@ -24,7 +24,15 @@ omarchy-shell shell rescanPlugins
 
 ## Use
 
-Click the radio icon. The panel has two columns. On the right, filter by name, by region, or both, and pick a station. On the left, the player stays visible, with favourites underneath. Click a row to play that stream with mpv. The player button pauses and resumes the current station. Choosing another station switches to it. Playback continues after the panel closes.
+Click the radio icon. The panel has two columns. On the right, filter by name, by region, or both, and pick a station. On the left, the player stays visible, with favourites underneath. Click a row to play that stream. The player button pauses and resumes the current station. Choosing another station switches to it. Playback continues after the panel closes.
+
+Playback is one mpv process. It has no network of its own. A local proxy accepts only public stream addresses, including after a redirect, and refuses addresses that resolve to this computer or the local network. The panel never opens mpv's socket. `radio-player` sends play, pause, and resume over it. Closing the panel leaves the station playing. Stop it with:
+
+```sh
+~/.config/omarchy/plugins/mattia.radio/radio-player stop
+```
+
+Logs are `$XDG_RUNTIME_DIR/mattia.radio/mpv.log` and `proxy.log`.
 
 The star on a row saves that station in the Favourites section. A saved station is one directory entry, identified by its id. While the directory still lists that id, playback uses the current stream. If a later refresh drops the id, the saved copy remains. Favourites are stored at `~/.local/state/mattia.radio/favourites.json` (or under `XDG_STATE_HOME` when that is set).
 
@@ -41,4 +49,4 @@ omarchy plugin validate .
 
 MIT. See [LICENSE](LICENSE).
 
-Needs Omarchy and mpv. No extra packages.
+Needs Omarchy, mpv, bubblewrap, socat, python, and iproute2. Those ship with Omarchy.

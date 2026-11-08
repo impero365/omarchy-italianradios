@@ -1,6 +1,7 @@
 // Pure helpers for the Italian radio panel. Directory text is untrusted:
 // names that contain markup are dropped, and only http(s) stream URLs and
-// https image icons are kept. Playback is an argv array, never a shell line.
+// https image icons are kept. Directory fetches are an argv array, never a
+// shell line. Playback goes through radio-player, which keeps one sandboxed mpv.
 
 var BODY_LIMIT = 4000000
 var STATION_CAP = 2500
@@ -287,49 +288,31 @@ function fetchCommand(hostIndex) {
   ]
 }
 
-function socketPathOk(value) {
-  var s = String(value == null ? "" : value)
-  if (s.length < 2 || s.length > 200 || s.charAt(0) !== "/") return ""
-  if (s.indexOf("..") !== -1) return ""
-  if (!/^[A-Za-z0-9._/-]+$/.test(s)) return ""
-  return s
-}
-
-var PAUSE_SCRIPT = [
-  "import json, socket, sys",
-  "s = socket.socket(socket.AF_UNIX)",
-  "s.settimeout(2)",
-  "s.connect(sys.argv[1])",
-  "body = json.dumps({'command': ['set_property', 'pause', sys.argv[2] == '1']}) + '\\n'",
-  "s.sendall(body.encode())",
-  "s.recv(256)"
-].join("\n")
-
-function playerCommand(stream, title, socketPath) {
-  var url = streamUrl(stream)
-  if (!url) return []
-  var args = [
-    "mpv",
-    "--no-video",
-    "--no-terminal",
-    "--force-window=no",
-    "--no-input-default-bindings",
-    "--really-quiet"
-  ]
-  var name = plainName(title, NAME_LIMIT)
-  if (name) args.push("--force-media-title=" + name)
-  var sock = socketPathOk(socketPath)
-  if (sock) args.push("--input-ipc-server=" + sock)
-  args.push("--", url)
-  return args
-}
-
-// One short-lived process writes a pause command. The shell does not keep
-// its own socket open, and playback is still one new mpv per station.
-function pauseCommand(socketPath, paused) {
-  var sock = socketPathOk(socketPath)
-  if (!sock) return []
-  return ["python3", "-c", PAUSE_SCRIPT, sock, paused ? "1" : "0"]
+function parsePlayerStatus(raw) {
+  var lines = String(raw == null ? "" : raw).split("\n")
+  for (var i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i]) continue
+    var data
+    try { data = JSON.parse(lines[i]) } catch (error) { continue }
+    if (!data || typeof data !== "object" || typeof data.running !== "boolean") continue
+    var id = data.id == null || data.id === "" ? "" : stationId(data.id)
+    if (data.id && !id) continue
+    var name = data.name == null || data.name === "" ? "" : plainName(data.name, NAME_LIMIT)
+    if (data.name && !name) continue
+    var reason = data.reason == null || data.reason === "" ? "" : String(data.reason)
+    if (reason !== "" && reason !== "no-player" && reason !== "playback") continue
+    return {
+      running: data.running === true,
+      paused: data.paused === true,
+      idle: data.idle !== false,
+      starting: data.starting === true,
+      error: data.error === true,
+      id: id,
+      name: name,
+      reason: reason
+    }
+  }
+  return null
 }
 
 function tooltipText(playingName, idleLabel, playingLabel) {
@@ -359,8 +342,7 @@ if (typeof module !== "undefined") {
     toggleFavourite: toggleFavourite,
     directoryUrl: directoryUrl,
     fetchCommand: fetchCommand,
-    playerCommand: playerCommand,
-    pauseCommand: pauseCommand,
+    parsePlayerStatus: parsePlayerStatus,
     tooltipText: tooltipText
   }
 }

@@ -10,8 +10,8 @@ import "Model.js" as Model
 // Bar icon that opens a filterable list of Italian web radios. The directory
 // is fetched only when the panel opens and the saved copy is missing or older
 // than a day. The left column is the player and favourites. The right column
-// is the filters and the station list. A click plays with mpv. The player
-// pauses and resumes that stream.
+// is the filters and the station list. A click asks radio-player to play the
+// stream in one sandboxed mpv. The player pauses and resumes that stream.
 Panel {
   id: root
   moduleName: "mattia.radio"
@@ -40,12 +40,13 @@ Panel {
     return base + "/mattia.radio"
   }
   readonly property string favouritesPath: stateDir !== "" ? stateDir + "/favourites.json" : ""
-  readonly property string runtimeDir: {
-    var run = String(Quickshell.env("XDG_RUNTIME_DIR") || "")
-    if (run.charAt(0) !== "/" || run.indexOf("..") !== -1 || /[\u0000-\u001F\s]/.test(run)) return ""
-    return run.replace(/\/+$/, "") + "/mattia.radio"
+  readonly property string playerPath: {
+    var text = Qt.resolvedUrl("radio-player").toString()
+    if (text.indexOf("file://") !== 0) return ""
+    var path = decodeURIComponent(text.slice(7))
+    if (path.charAt(0) !== "/" || path.indexOf("..") !== -1 || /[\u0000-\u001F]/.test(path)) return ""
+    return path
   }
-  readonly property string socketPath: runtimeDir !== "" ? runtimeDir + "/mpv.sock" : ""
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.45)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
@@ -67,11 +68,7 @@ Panel {
     for (var i = 0; i < rows.length; i++) mark[rows[i].id] = true
     return mark
   }
-  readonly property var shownFavourites: Model.filterStations(
-    Model.resolveFavourites(favourites, stations),
-    query,
-    regionQuery
-  )
+  readonly property var shownFavourites: Model.resolveFavourites(favourites, stations)
   property int selectedIndex: 0
   property bool wheelScrolling: false
   property real lastCursorMs: 0
@@ -84,26 +81,16 @@ Panel {
   property string playingId: ""
   property string playingName: ""
   property bool paused: false
-  property int playGeneration: 0
-  property bool pauseBusy: false
-  property bool pauseDirty: false
-  property bool pauseWanted: false
-  property bool pauseSent: false
-  property int pauseGeneration: 0
-  property bool preparingPlayback: false
-  property var pendingCommand: null
-  property bool stopRequested: false
-  readonly property bool playerRunning: player.running
+  property bool playerActive: false
   property bool playbackError: false
-  property bool mpvOk: true
-  property bool mpvChecked: false
+  property string playerReason: ""
 
   readonly property var filtered: Model.filterStations(stations, query, regionQuery)
   readonly property string statusText: {
     if (fetchBusy && stations.length === 0) return strings.t("panel.loading")
     if (loadFailed && stations.length === 0) return strings.t("panel.failed")
-    if (stations.length > 0 && filtered.length === 0 && shownFavourites.length === 0) return strings.t("panel.none")
-    if (playbackError && !mpvOk) return strings.t("panel.noPlayer")
+    if (stations.length > 0 && filtered.length === 0) return strings.t("panel.none")
+    if (playbackError && playerReason === "no-player") return strings.t("panel.noPlayer")
     if (playbackError) return strings.t("panel.playbackFailed")
     if (stations.length === 0) return ""
     return strings.tn("panel.count", filtered.length).arg(Commons.I18n.formatNumber(filtered.length))
@@ -303,83 +290,84 @@ Panel {
     toggleStation(filtered[selectedIndex])
   }
 
+  function applyPlayerStatus(raw, failed) {
+    var status = Model.parsePlayerStatus(raw)
+    if (!status) {
+      if (failed) {
+        playbackError = true
+        playerReason = "playback"
+        playerActive = false
+      }
+      return
+    }
+    if (!status.running && !status.error) {
+      playingId = ""
+      playingName = ""
+      paused = false
+      playerActive = false
+      playbackError = false
+      playerReason = ""
+      return
+    }
+    if (status.id) playingId = status.id
+    if (status.name) playingName = status.name
+    paused = status.paused
+    playerActive = status.running && !status.error && (!status.idle || status.starting)
+    playbackError = status.error || (failed && !playerActive)
+    playerReason = playbackError ? (status.reason || "playback") : ""
+  }
+
+  function runPlayer(args) {
+    if (!playerPath || !args || args.length === 0) {
+      playbackError = true
+      playerReason = "no-player"
+      playerActive = false
+      return
+    }
+    if (playerAction.running) {
+      playerAction.queued = args
+      return
+    }
+    playerAction.output = ""
+    playerAction.errorOutput = ""
+    playerAction.command = args
+    playerAction.running = true
+  }
+
+  function refreshStatus() {
+    if (!playerPath || playerAction.running || statusProc.running) return
+    statusProc.output = ""
+    statusProc.command = [playerPath, "status"]
+    statusProc.running = true
+  }
+
   function toggleStation(station) {
     if (!station) return
-    if (station.id === playingId && player.running) {
+    if (station.id === playingId && playerActive) {
       togglePause()
       return
     }
-    var command = Model.playerCommand(station.stream, station.name, socketPath)
-    if (!command.length || (mpvChecked && !mpvOk)) {
+    if (!Model.streamUrl(station.stream)) {
       playbackError = true
+      playerReason = "playback"
       return
     }
     playbackError = false
-    pendingCommand = { command: command, id: station.id, name: station.name }
-    if (player.running) {
-      stopRequested = true
-      player.running = false
-    } else {
-      startPending()
-    }
+    playerReason = ""
+    paused = false
+    playerActive = true
+    playingId = station.id
+    playingName = station.name
+    runPlayer([playerPath, "play", station.id, station.name, station.stream])
   }
 
   function togglePause() {
-    if (!player.running) {
+    if (!playerActive) {
       if (selectedIndex >= 0 && selectedIndex < filtered.length)
         toggleStation(filtered[selectedIndex])
       return
     }
-    pauseWanted = (pauseDirty || pauseBusy) ? !pauseWanted : !paused
-    pauseDirty = true
-    dispatchPause()
-  }
-
-  function dispatchPause() {
-    if (pauseBusy || !pauseDirty || !player.running) return
-    var command = Model.pauseCommand(socketPath, pauseWanted)
-    if (!command.length) {
-      pauseDirty = false
-      return
-    }
-    pauseSent = pauseWanted
-    pauseGeneration = playGeneration
-    pauseDirty = false
-    pauseBusy = true
-    pauseProc.command = command
-    pauseProc.running = true
-  }
-
-  function startPending() {
-    if (!pendingCommand || player.running || preparingPlayback) return
-    if (socketPath === "") {
-      launchNow()
-      return
-    }
-    preparingPlayback = true
-    socketClean.command = ["rm", "-f", socketPath]
-    socketClean.running = true
-  }
-
-  function launchNow() {
-    preparingPlayback = false
-    var next = pendingCommand
-    pendingCommand = null
-    if (!next) return
-    if (player.running) {
-      pendingCommand = next
-      stopRequested = true
-      player.running = false
-      return
-    }
-    playGeneration += 1
-    paused = false
-    pauseDirty = false
-    player.command = next.command
-    playingId = next.id
-    playingName = next.name
-    stopRequested = false
-    player.running = true
+    runPlayer([playerPath, "toggle"])
   }
 
   onQueryChanged: {
@@ -398,7 +386,7 @@ Panel {
     if (!opened) return
     panel.ensureContent()
     refreshIfStale()
-    if (!mpvChecked && !mpvCheck.running) mpvCheck.running = true
+    Qt.callLater(refreshStatus)
     Qt.callLater(focusFilter)
   }
 
@@ -473,68 +461,43 @@ Panel {
     }
   }
 
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.opened && !playerAction.running && !statusProc.running
+    onTriggered: root.refreshStatus()
+  }
+
   Process {
-    id: mpvCheck
-    command: ["mpv", "--version"]
-    stdout: StdioCollector { waitForEnd: true }
+    id: playerAction
+    property var queued: null
+    property string output: ""
+    property string errorOutput: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: playerAction.output = text
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: playerAction.errorOutput = text
+    }
     onExited: function(code) {
-      root.mpvChecked = true
-      root.mpvOk = code === 0
+      var queued = playerAction.queued
+      playerAction.queued = null
+      root.applyPlayerStatus(playerAction.output, code !== 0)
+      if (queued) root.runPlayer(queued)
     }
   }
 
   Process {
-    id: player
-    onExited: function(code) {
-      if (root.pendingCommand) {
-        root.startPending()
-        return
-      }
-      if (root.stopRequested) {
-        root.stopRequested = false
-        return
-      }
-      root.playingId = ""
-      root.playingName = ""
-      root.paused = false
-      root.pauseDirty = false
-      if (code !== 0) root.playbackError = true
+    id: statusProc
+    property string output: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: statusProc.output = text
     }
-  }
-
-  Process {
-    id: socketClean
-    onExited: function() {
-      if (!root.pendingCommand) {
-        root.preparingPlayback = false
-        return
-      }
-      runtimeMkdir.running = true
-    }
-  }
-
-  Process {
-    id: runtimeMkdir
-    command: ["mkdir", "-p", root.runtimeDir]
     onExited: function(code) {
-      if (code !== 0) {
-        root.preparingPlayback = false
-        root.pendingCommand = null
-        root.playbackError = true
-        return
-      }
-      root.launchNow()
-    }
-  }
-
-  Process {
-    id: pauseProc
-    onExited: function(code) {
-      root.pauseBusy = false
-      if (code === 0 && root.pauseGeneration === root.playGeneration)
-        root.paused = root.pauseSent
-      if (root.pauseGeneration === root.playGeneration && root.pauseDirty)
-        root.dispatchPause()
+      if (!playerAction.running) root.applyPlayerStatus(statusProc.output, code !== 0)
     }
   }
 
@@ -596,6 +559,8 @@ Panel {
     bar: root.bar
     text: root.radioGlyph
     tooltipText: root.tooltipText
+    active: root.playerActive && !root.paused
+    activeColor: "#f5c518"
     onPressed: root.toggle()
   }
 
@@ -731,9 +696,9 @@ Panel {
 
                 PanelActionButton {
                   id: playButton
-                  enabled: root.playerRunning || (root.selectedIndex >= 0 && root.selectedIndex < root.filtered.length)
-                  iconText: (!root.playerRunning || root.paused) ? root.playGlyph : root.pauseGlyph
-                  tooltipText: (!root.playerRunning || root.paused) ? strings.t("panel.play") : strings.t("panel.pause")
+                  enabled: root.playerActive || (root.selectedIndex >= 0 && root.selectedIndex < root.filtered.length)
+                  iconText: (!root.playerActive || root.paused) ? root.playGlyph : root.pauseGlyph
+                  tooltipText: (!root.playerActive || root.paused) ? strings.t("panel.play") : strings.t("panel.pause")
                   foreground: root.foreground
                   fontFamily: root.fontFamily
                   onClicked: root.togglePause()
@@ -773,17 +738,6 @@ Panel {
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
-        }
-
-        Text {
-          width: parent.width
-          visible: root.favourites.length > 0 && root.shownFavourites.length === 0 && root.filtered.length > 0
-          textFormat: Text.PlainText
-          text: strings.t("panel.favouritesNone")
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          elide: Text.ElideRight
         }
 
         ListView {

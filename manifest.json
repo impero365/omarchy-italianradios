@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "mattia.radio",
+  "name": "Italian radios",
+  "version": "1.0.0",
+  "author": "Mattia",
+  "description": "Italian web radio streams from the Radio Browser directory",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Italian radios",
+    "description": "Play Italian web radio on the current audio device",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

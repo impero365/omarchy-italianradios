@@ -1,0 +1,19 @@
+{
+  "tooltip.idle": "Italian radios",
+  "tooltip.playing": "Playing %1",
+  "panel.title": "Italian radios",
+  "panel.filter": "Filter by name",
+  "panel.region": "Filter by region",
+  "panel.source": "The list is loaded from Radio Browser when you open this panel, saved on this computer, and loaded again after a day.",
+  "panel.loading": "Loading the directory…",
+  "panel.failed": "The directory could not be loaded",
+  "panel.none": "No stations match",
+  "panel.count": {
+    "one": "%1 station",
+    "other": "%1 stations"
+  },
+  "panel.playing": "Playing %1",
+  "panel.stop": "Stop",
+  "panel.noPlayer": "mpv is not available, so playback cannot start",
+  "panel.playbackFailed": "Playback stopped"
+}

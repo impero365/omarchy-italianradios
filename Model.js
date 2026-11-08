@@ -9,6 +9,7 @@ var NAME_LIMIT = 80
 var REGION_LIMIT = 48
 var URL_LIMIT = 500
 var CACHE_MAX_AGE_MS = 24 * 60 * 60 * 1000
+var FAVOURITE_CAP = 100
 
 var DIRECTORY_HOSTS = [
   "https://de1.api.radio-browser.info",
@@ -185,6 +186,67 @@ function cacheIsStale(fetchedAt, now) {
   return age > CACHE_MAX_AGE_MS
 }
 
+function parseFavourites(raw) {
+  var text = String(raw || "")
+  if (!text || text.length > BODY_LIMIT) return []
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return []
+  }
+  var items = Array.isArray(data) ? data : (data && Array.isArray(data.stations) ? data.stations : null)
+  if (!items) return []
+  var out = []
+  var seen = {}
+  var scan = Math.min(items.length, SCAN_CAP)
+  for (var i = 0; i < scan && out.length < FAVOURITE_CAP; i++) {
+    var row = acceptStation(items[i])
+    if (!row || seen[row.id]) continue
+    seen[row.id] = true
+    out.push(row)
+  }
+  return out
+}
+
+function favouritesPayload(list) {
+  return JSON.stringify({ stations: parseFavourites(JSON.stringify({ stations: list || [] })) })
+}
+
+// Saved order is the user's order. A station still in the directory uses that
+// newer row; a station the directory dropped keeps its saved snapshot.
+function resolveFavourites(saved, directory) {
+  var byId = {}
+  var dir = directory || []
+  for (var i = 0; i < dir.length; i++) {
+    if (dir[i] && dir[i].id) byId[dir[i].id] = dir[i]
+  }
+  var rows = parseFavourites(JSON.stringify({ stations: saved || [] }))
+  var out = []
+  for (var j = 0; j < rows.length; j++) out.push(byId[rows[j].id] || rows[j])
+  return out
+}
+
+function toggleFavourite(saved, station) {
+  var rows = parseFavourites(JSON.stringify({ stations: saved || [] }))
+  var row = acceptStation(station)
+  if (!row) return rows
+  var next = []
+  var found = false
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].id === row.id) {
+      found = true
+      continue
+    }
+    next.push(rows[i])
+  }
+  if (!found) {
+    next.unshift(row)
+    if (next.length > FAVOURITE_CAP) next.length = FAVOURITE_CAP
+  }
+  return next
+}
+
 function filterStations(list, nameQuery, regionQuery) {
   var src = list || []
   var name = foldQuery(nameQuery)
@@ -225,7 +287,25 @@ function fetchCommand(hostIndex) {
   ]
 }
 
-function playerCommand(stream, title) {
+function socketPathOk(value) {
+  var s = String(value == null ? "" : value)
+  if (s.length < 2 || s.length > 200 || s.charAt(0) !== "/") return ""
+  if (s.indexOf("..") !== -1) return ""
+  if (!/^[A-Za-z0-9._/-]+$/.test(s)) return ""
+  return s
+}
+
+var PAUSE_SCRIPT = [
+  "import json, socket, sys",
+  "s = socket.socket(socket.AF_UNIX)",
+  "s.settimeout(2)",
+  "s.connect(sys.argv[1])",
+  "body = json.dumps({'command': ['set_property', 'pause', sys.argv[2] == '1']}) + '\\n'",
+  "s.sendall(body.encode())",
+  "s.recv(256)"
+].join("\n")
+
+function playerCommand(stream, title, socketPath) {
   var url = streamUrl(stream)
   if (!url) return []
   var args = [
@@ -238,8 +318,18 @@ function playerCommand(stream, title) {
   ]
   var name = plainName(title, NAME_LIMIT)
   if (name) args.push("--force-media-title=" + name)
+  var sock = socketPathOk(socketPath)
+  if (sock) args.push("--input-ipc-server=" + sock)
   args.push("--", url)
   return args
+}
+
+// One short-lived process writes a pause command. The shell does not keep
+// its own socket open, and playback is still one new mpv per station.
+function pauseCommand(socketPath, paused) {
+  var sock = socketPathOk(socketPath)
+  if (!sock) return []
+  return ["python3", "-c", PAUSE_SCRIPT, sock, paused ? "1" : "0"]
 }
 
 function tooltipText(playingName, idleLabel, playingLabel) {
@@ -253,6 +343,7 @@ if (typeof module !== "undefined") {
     BODY_LIMIT: BODY_LIMIT,
     STATION_CAP: STATION_CAP,
     CACHE_MAX_AGE_MS: CACHE_MAX_AGE_MS,
+    FAVOURITE_CAP: FAVOURITE_CAP,
     plainName: plainName,
     foldQuery: foldQuery,
     streamUrl: streamUrl,
@@ -262,9 +353,14 @@ if (typeof module !== "undefined") {
     cachePayload: cachePayload,
     cacheIsStale: cacheIsStale,
     filterStations: filterStations,
+    parseFavourites: parseFavourites,
+    favouritesPayload: favouritesPayload,
+    resolveFavourites: resolveFavourites,
+    toggleFavourite: toggleFavourite,
     directoryUrl: directoryUrl,
     fetchCommand: fetchCommand,
     playerCommand: playerCommand,
+    pauseCommand: pauseCommand,
     tooltipText: tooltipText
   }
 }

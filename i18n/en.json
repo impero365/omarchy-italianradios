@@ -4,6 +4,12 @@
   "panel.title": "Italian radios",
   "panel.filter": "Filter by name",
   "panel.region": "Filter by region",
+  "panel.favourites": "Favourites",
+  "panel.favouritesEmpty": "Star a station to keep it in this section.",
+  "panel.favouritesNone": "No favourites match",
+  "panel.favouriteAdd": "Save favourite",
+  "panel.favouriteRemove": "Remove favourite",
+  "panel.clear": "Clear",
   "panel.source": "The list is loaded from Radio Browser when you open this panel, saved on this computer, and loaded again after a day.",
   "panel.loading": "Loading the directory…",
   "panel.failed": "The directory could not be loaded",
@@ -13,7 +19,10 @@
     "other": "%1 stations"
   },
   "panel.playing": "Playing %1",
-  "panel.stop": "Stop",
+  "panel.paused": "Paused · %1",
+  "panel.playerIdle": "Nothing playing",
+  "panel.play": "Play",
+  "panel.pause": "Pause",
   "panel.noPlayer": "mpv is not available, so playback cannot start",
   "panel.playbackFailed": "Playback stopped"
 }

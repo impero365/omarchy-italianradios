@@ -24,7 +24,9 @@ omarchy-shell shell rescanPlugins
 
 ## Use
 
-Click the radio icon. The panel lists each station with its icon and name, and the region when the directory has one. Filter by name, by region, or both. Click a row to play that stream with mpv. Click the same row again, or Stop, to stop. Playback continues after the panel closes.
+Click the radio icon. The panel has two columns. On the right, filter by name, by region, or both, and pick a station. On the left, the player stays visible, with favourites underneath. Click a row to play that stream with mpv. The player button pauses and resumes the current station. Choosing another station switches to it. Playback continues after the panel closes.
+
+The star on a row saves that station in the Favourites section. A saved station is one directory entry, identified by its id. While the directory still lists that id, playback uses the current stream. If a later refresh drops the id, the saved copy remains. Favourites are stored at `~/.local/state/mattia.radio/favourites.json` (or under `XDG_STATE_HOME` when that is set).
 
 The list is saved at `~/.cache/mattia.radio/stations.json`. Opening the panel uses that copy when it is less than a day old, and fetches the directory again when it is older or missing. The request goes to `de1.api.radio-browser.info`, then to `de2.api.radio-browser.info` if the first host fails.
 

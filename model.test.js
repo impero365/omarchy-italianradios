@@ -111,6 +111,21 @@ test("playback and directory fetches are fixed argv, not a shell", function() {
   assert.equal(play.filter(function(arg) { return arg.indexOf("--force-media-title=") === 0 }).length, 1)
   assert.equal(Model.playerCommand("file:///tmp/x", "Nope").length, 0)
   assert.equal(Model.playerCommand("https://example.test/a; rm -rf /", "Nope").length, 0)
+  assert.equal(Model.playerCommand("https://example.test/stream", "Radio Capital").indexOf("--idle=yes"), -1)
+  var sock = "/run/user/1000/mattia.radio/mpv.sock"
+  var withSock = Model.playerCommand("https://example.test/stream", "Radio Capital", sock)
+  assert.ok(withSock.indexOf("--input-ipc-server=" + sock) !== -1)
+  assert.equal(withSock.indexOf("--idle=yes"), -1)
+  assert.equal(withSock[withSock.length - 1], "https://example.test/stream")
+  var unsafe = Model.playerCommand("https://example.test/stream", "Radio Capital", "/tmp/bad;rm")
+  assert.equal(unsafe.filter(function(arg) { return arg.indexOf("--input-ipc-server=") === 0 }).length, 0)
+  var pause = Model.pauseCommand(sock, true)
+  assert.equal(pause[0], "python3")
+  assert.equal(pause.indexOf("sh"), -1)
+  assert.equal(pause[pause.length - 2], sock)
+  assert.equal(pause[pause.length - 1], "1")
+  assert.equal(Model.pauseCommand("/tmp/not safe", false).length, 0)
+  assert.equal(Model.pauseCommand("/tmp/../sock", false).length, 0)
 
   var fetch = Model.fetchCommand(0)
   assert.equal(fetch[0], "curl")
@@ -119,6 +134,79 @@ test("playback and directory fetches are fixed argv, not a shell", function() {
   assert.equal(Model.fetchCommand(1)[Model.fetchCommand(1).length - 1].indexOf("https://de2.api.radio-browser.info/"), 0)
   assert.equal(Model.fetchCommand(2).length, 0)
   assert.equal(Model.fetchCommand("https://evil.example/").length, 0)
+})
+
+test("favourites keep the user's order and prefer a live directory row", function() {
+  var liveId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+  var goneId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+  var saved = [
+    {
+      id: goneId,
+      name: "Gone Radio",
+      region: "Lazio",
+      stream: "https://old.example.test/gone",
+      icon: ""
+    },
+    {
+      id: liveId,
+      name: "Old Name",
+      region: "",
+      stream: "https://old.example.test/live",
+      icon: ""
+    },
+    {
+      id: goneId,
+      name: "Duplicate",
+      region: "",
+      stream: "https://old.example.test/dup",
+      icon: ""
+    },
+    {
+      id: "cccccccc-cccc-cccc-cccc-cccccccccccc",
+      name: MARKUP,
+      region: "Lazio",
+      stream: "javascript:alert(1)",
+      icon: ""
+    }
+  ]
+  var stored = Model.parseFavourites(Model.favouritesPayload(saved))
+  assert.deepEqual(stored.map(function(row) { return row.id }), [goneId, liveId])
+
+  var directory = Model.parseDirectory(JSON.stringify([
+    station({
+      stationuuid: liveId,
+      name: "Live Name",
+      state: "Toscana",
+      url_resolved: "https://live.example.test/stream"
+    })
+  ]))
+  var resolved = Model.resolveFavourites(stored, directory)
+  assert.equal(resolved[0].stream, "https://old.example.test/gone")
+  assert.equal(resolved[1].name, "Live Name")
+  assert.equal(resolved[1].region, "Toscana")
+  assert.equal(resolved[1].stream, "https://live.example.test/stream")
+
+  var removed = Model.toggleFavourite(stored, directory[0])
+  assert.deepEqual(removed.map(function(row) { return row.id }), [goneId])
+  var added = Model.toggleFavourite(removed, directory[0])
+  assert.equal(added[0].id, liveId)
+  assert.equal(added[0].name, "Live Name")
+  assert.equal(added[0].stream, "https://live.example.test/stream")
+  assert.equal(added.length, 2)
+  assert.equal(Model.toggleFavourite(added, { id: "nope", name: "X", stream: "file:///tmp/x" }).length, 2)
+
+  var many = []
+  for (var n = 0; n < Model.FAVOURITE_CAP + 5; n++) {
+    many.push({
+      id: "dddddddd-dddd-dddd-dddd-" + String(100000000000 + n),
+      name: "Station " + n,
+      region: "",
+      stream: "https://example.test/" + n,
+      icon: ""
+    })
+  }
+  assert.equal(Model.parseFavourites(JSON.stringify({ stations: many })).length, Model.FAVOURITE_CAP)
+  assert.equal(Model.parseFavourites("not json").length, 0)
 })
 
 test("a saved list is checked again and expires after a day", function() {

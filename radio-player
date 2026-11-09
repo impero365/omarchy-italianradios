@@ -113,7 +113,7 @@ for arg in "$@"; do
 done
 
 set +e
-output=$(printf '%s' "$payload" | socat -T 20 - "UNIX-CONNECT:${socket}")
+output=$(printf '%s' "$payload" | socat -t 2 -T 20 - "UNIX-CONNECT:${socket}")
 socat_status=$?
 set -e
 [[ $socat_status -eq 0 ]] || fail

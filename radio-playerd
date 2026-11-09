@@ -1,0 +1,664 @@
+#!/usr/bin/env python3
+"""Long-lived player for one Italian radio station.
+
+radio-player is the short command the panel runs. It forwards each request
+here. This process stays up, so a later click does not start Python again.
+The first play starts radio-session. Later plays send loadfile to that mpv.
+Stop ends the mpv session and leaves this process running.
+"""
+
+import fcntl
+import importlib.machinery
+import importlib.util
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+START_GRACE_S = 8
+UUID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+REQUIRED_TOOLS = ("mpv", "bwrap", "socat", "python3", "ip", "setpriv")
+
+
+def proxy_module():
+    loader = importlib.machinery.SourceFileLoader(
+        "mattia_radio_proxy", str(SCRIPT_DIR / "radio-proxy")
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+PROXY = proxy_module()
+
+
+def runtime_dir():
+    raw = os.environ.get("XDG_RUNTIME_DIR", "")
+    if not raw.startswith("/") or ".." in raw or any(ord(ch) < 32 or ch.isspace() for ch in raw):
+        raise SystemExit("Italian radios requires a usable XDG_RUNTIME_DIR")
+    path = Path(raw) / "mattia.radio"
+    path.mkdir(mode=0o700, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+class Player:
+    def __init__(self):
+        self.runtime = runtime_dir()
+        self.socket_path = self.runtime / "mpv.sock"
+        self.proxy_socket = self.runtime / "proxy.sock"
+        self.pid_file = self.runtime / "player.pid"
+        self.meta_file = self.runtime / "status.json"
+        self.session_log = self.runtime / "session.log"
+        self.mpv_log = self.runtime / "mpv.log"
+        self.proxy_log = self.runtime / "proxy.log"
+        self.lock_file = self.runtime / "player.lock"
+        self._lock_fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
+        self.reply = None
+
+    def lock(self):
+        fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
+
+    def unlock(self):
+        fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+
+    def process_start(self, pid):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            return None
+        end = stat.rfind(")")
+        if end < 0:
+            return None
+        fields = stat[end + 2 :].split()
+        if not fields or fields[0] == "Z" or len(fields) < 20:
+            return None
+        return fields[19]
+
+    def read_pid(self):
+        try:
+            pid_text, start_text = self.pid_file.read_text().split()
+            pid = int(pid_text)
+        except (OSError, ValueError):
+            return None
+        if self.process_start(pid) != start_text:
+            return None
+        return pid
+
+    def alive(self):
+        pid = self.read_pid()
+        if pid is None:
+            return False
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def write_pid(self, pid):
+        start = self.process_start(pid)
+        if start is None:
+            return False
+        temporary = self.runtime / f"player.{os.getpid()}.tmp"
+        temporary.write_text(f"{pid} {start}\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.pid_file)
+        return True
+
+    def cleanup_dead(self):
+        if self.alive():
+            return
+        for path in (self.pid_file, self.proxy_socket, self.socket_path):
+            path.unlink(missing_ok=True)
+
+    def terminate(self):
+        pid = self.read_pid()
+        if pid is None:
+            self.cleanup_dead()
+            return True
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        for _ in range(100):
+            if not self.alive():
+                break
+            time.sleep(0.02)
+        if self.alive():
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            for _ in range(50):
+                if not self.alive():
+                    break
+                time.sleep(0.02)
+        if self.alive():
+            return False
+        self.cleanup_dead()
+        return True
+
+    def read_meta(self):
+        try:
+            data = json.loads(self.meta_file.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "id": data.get("id") if isinstance(data.get("id"), str) else "",
+            "name": data.get("name") if isinstance(data.get("name"), str) else "",
+            "since": data.get("since") if isinstance(data.get("since"), (int, float)) else 0,
+            "seen": data.get("seen") is True,
+            "logOffset": data.get("logOffset") if isinstance(data.get("logOffset"), int) else 0,
+            "proxyOffset": data.get("proxyOffset") if isinstance(data.get("proxyOffset"), int) else 0,
+        }
+
+    def write_meta(self, **fields):
+        meta = self.read_meta()
+        meta.update(fields)
+        temporary = self.runtime / f"status.{os.getpid()}.tmp"
+        temporary.write_text(json.dumps(meta))
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.meta_file)
+
+    def ipc(self, payload, timeout=3):
+        raw = json.dumps(payload).encode() + b"\n"
+        with socket.socket(socket.AF_UNIX) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(self.socket_path))
+            sock.sendall(raw)
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(65_536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > 65_536:
+                    raise OSError("mpv reply is too large")
+        if not buf:
+            raise OSError("mpv closed the socket")
+        return json.loads(buf.split(b"\n", 1)[0])
+
+    def property(self, name):
+        try:
+            reply = self.ipc({"command": ["get_property", name]})
+        except (OSError, json.JSONDecodeError):
+            return None
+        if reply.get("error") != "success":
+            return None
+        return reply.get("data")
+
+    def tools_ready(self):
+        return all(shutil.which(tool) for tool in REQUIRED_TOOLS)
+
+    def start(self):
+        self.cleanup_dead()
+        self.mpv_log.write_text("")
+        command = [
+            str(SCRIPT_DIR / "radio-session"),
+            "mpv",
+            "--no-config",
+            "--no-video",
+            "--force-window=no",
+            "--audio-display=no",
+            "--audio-client-name=Italian radios",
+            "--idle=yes",
+            "--pause=no",
+            "--keep-open=no",
+            "--load-unsafe-playlists=no",
+            "--load-scripts=no",
+            "--ytdl=no",
+            "--no-input-default-bindings",
+            "--network-timeout=15",
+            "--cache-secs=10",
+            "--http-proxy=http://127.0.0.1:18765",
+            f"--input-ipc-server={self.socket_path}",
+            f"--log-file={self.mpv_log}",
+            "--msg-level=all=warn",
+            "--no-terminal",
+            "--really-quiet",
+        ]
+        log = self.session_log.open("ab")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=str(self.runtime),
+            )
+        finally:
+            log.close()
+        if not self.write_pid(process.pid):
+            self.terminate()
+            return False
+        for _ in range(150):
+            if self.socket_path.is_socket():
+                return True
+            if not self.alive():
+                break
+            time.sleep(0.02)
+        self.terminate()
+        return False
+
+    def ensure(self):
+        if self.alive() and self.socket_path.is_socket():
+            return True
+        self.cleanup_dead()
+        return self.start()
+
+    def tail_text(self, path, offset):
+        try:
+            with path.open("rb") as handle:
+                handle.seek(max(0, offset))
+                return handle.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def open_failed(self, meta):
+        text = self.tail_text(self.mpv_log, meta["logOffset"]).lower()
+        proxy_text = self.tail_text(self.proxy_log, meta["proxyOffset"])
+        return (
+            "403 forbidden" in text
+            or "failed to open" in text
+            or "can not open" in text
+            or "cannot open" in text
+            or "outcome=forbidden" in proxy_text
+        )
+
+    def snapshot(self, reason=""):
+        meta = self.read_meta()
+        running = self.alive() and self.socket_path.is_socket()
+        paused = False
+        idle = True
+        error = False
+        starting = False
+        if running:
+            paused = self.property("pause") is True
+            audio = self.property("audio-params")
+            playing = isinstance(audio, dict)
+            idle = not playing
+            age = time.time() - meta["since"] if meta["since"] else START_GRACE_S
+            if playing and not self.open_failed(meta):
+                self.write_meta(seen=True)
+                meta["seen"] = True
+            elif self.open_failed(meta) or (meta["seen"] and meta["since"] and idle) or (
+                meta["since"] and age >= START_GRACE_S
+            ):
+                error = True
+                idle = True
+            elif meta["since"]:
+                starting = True
+                idle = True
+        if not running:
+            paused = False
+            idle = True
+            if reason in {"no-player", "playback"}:
+                error = True
+        if error and reason == "":
+            reason = "playback"
+        return {
+            "running": running,
+            "paused": paused and running and not idle and not error,
+            "idle": idle or not running,
+            "starting": starting and running and not error,
+            "id": meta["id"] if running or error else "",
+            "name": meta["name"] if running or error else "",
+            "error": error,
+            "reason": reason if error else "",
+        }
+
+    def emit(self, status):
+        payload = json.dumps(status, separators=(",", ":"))
+        # The bar reads this after a plugin reload. The panel's own memory is gone then.
+        try:
+            temporary = self.runtime / f".playback-{os.getpid()}.tmp"
+            temporary.write_text(payload + "\n")
+            os.chmod(temporary, 0o600)
+            temporary.replace(self.runtime / "playback.json")
+        except OSError:
+            pass
+        stream = self.reply if self.reply is not None else sys.stdout
+        stream.write(payload + "\n")
+        stream.flush()
+
+
+def stream_allowed(url):
+    if not isinstance(url, str) or not 12 <= len(url) <= 500:
+        return False
+    if re.search(r"[\u0000-\u001f\u007f\s<>\"'\\]", url):
+        return False
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme.lower() not in {"http", "https"}:
+        return False
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        return False
+    host = parts.hostname
+    if not host or ".." in host:
+        return False
+    if port is not None and not 1 <= port <= 65_535:
+        return False
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None and not PROXY.address_allowed(literal):
+        return False
+    return True
+
+
+def clean_name(name):
+    if not isinstance(name, str):
+        return ""
+    text = re.sub(r"[\u0000-\u001f\u007f]+", " ", name)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text or "<" in text or ">" in text:
+        return ""
+    return text[:80].rstrip()
+
+
+def play(player, station_id, name, url):
+    if not UUID.match(station_id or "") or not stream_allowed(url):
+        player.emit(player.snapshot("playback"))
+        return 3
+    title = clean_name(name)
+    if not title:
+        player.emit(player.snapshot("playback"))
+        return 3
+    if not player.tools_ready():
+        player.emit({
+            "running": False,
+            "paused": False,
+            "idle": True,
+            "id": "",
+            "name": "",
+            "error": True,
+            "reason": "no-player",
+        })
+        return 4
+
+    player.lock()
+    try:
+        if not player.ensure():
+            player.emit(player.snapshot("no-player"))
+            return 4
+        offset = player.mpv_log.stat().st_size if player.mpv_log.exists() else 0
+        proxy_offset = player.proxy_log.stat().st_size if player.proxy_log.exists() else 0
+        player.write_meta(
+            id=station_id,
+            name=title,
+            since=time.time(),
+            seen=False,
+            logOffset=offset,
+            proxyOffset=proxy_offset,
+        )
+        try:
+            reply = player.ipc({
+                "command": [
+                    "loadfile",
+                    url,
+                    "replace",
+                    -1,
+                    {"force-media-title": title},
+                ]
+            })
+        except (OSError, json.JSONDecodeError):
+            player.emit(player.snapshot("playback"))
+            return 4
+        if reply.get("error") != "success":
+            player.emit(player.snapshot("playback"))
+            return 4
+        try:
+            player.ipc({"command": ["set_property", "pause", False]})
+        except (OSError, json.JSONDecodeError):
+            player.emit(player.snapshot("playback"))
+            return 4
+    finally:
+        player.unlock()
+
+    deadline = time.time() + START_GRACE_S
+    while time.time() < deadline:
+        player.lock()
+        try:
+            status = player.snapshot()
+        finally:
+            player.unlock()
+        if not status["running"] or status["error"] or not status["idle"]:
+            player.emit(status)
+            return 0 if status["running"] and not status["error"] else 4
+        time.sleep(0.1)
+    player.lock()
+    try:
+        status = player.snapshot()
+    finally:
+        player.unlock()
+    player.emit(status)
+    return 0 if status["running"] and not status["error"] else 4
+
+
+def set_pause(player, paused):
+    player.lock()
+    try:
+        if not player.alive():
+            player.emit(player.snapshot())
+            return 4
+        try:
+            reply = player.ipc({"command": ["set_property", "pause", paused]})
+        except (OSError, json.JSONDecodeError):
+            player.emit(player.snapshot("playback"))
+            return 4
+        if reply.get("error") != "success":
+            player.emit(player.snapshot("playback"))
+            return 4
+        status = player.snapshot()
+    finally:
+        player.unlock()
+    player.emit(status)
+    return 0
+
+
+def toggle(player):
+    player.lock()
+    try:
+        if not player.alive():
+            player.emit(player.snapshot())
+            return 4
+        paused = player.property("pause") is True
+    finally:
+        player.unlock()
+    return set_pause(player, not paused)
+
+
+def stop(player):
+    player.lock()
+    try:
+        if not player.terminate():
+            player.emit(player.snapshot("playback"))
+            return 4
+        player.write_meta(id="", name="", since=0, seen=False, logOffset=0, proxyOffset=0)
+        status = player.snapshot()
+    finally:
+        player.unlock()
+    player.emit(status)
+    return 0
+
+
+def status(player):
+    player.lock()
+    try:
+        current = player.snapshot()
+    finally:
+        player.unlock()
+    player.emit(current)
+    return 0
+
+
+def dispatch(player, args):
+    action = args[0] if args else "status"
+    if action == "play" and len(args) == 4:
+        return play(player, args[1], args[2], args[3])
+    if action == "pause" and len(args) == 1:
+        return set_pause(player, True)
+    if action == "resume" and len(args) == 1:
+        return set_pause(player, False)
+    if action == "toggle" and len(args) == 1:
+        return toggle(player)
+    if action == "stop" and len(args) == 1:
+        return stop(player)
+    if action == "status" and len(args) == 1:
+        return status(player)
+    print(
+        "usage: radio-player play ID NAME URL | pause | resume | toggle | stop | status",
+        file=sys.stderr,
+    )
+    return 2
+
+
+MAX_COMMAND_BYTES = 8192
+
+
+def read_command(conn):
+    data = bytearray()
+    while len(data) <= MAX_COMMAND_BYTES:
+        try:
+            chunk = conn.recv(4096)
+        except TimeoutError:
+            break
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) > MAX_COMMAND_BYTES:
+        raise ValueError("command is too large")
+    return bytes(data)
+
+
+def parse_command(data):
+    args = []
+    index = 0
+    while index < len(data):
+        colon = data.find(b":", index)
+        if colon <= index:
+            raise ValueError("command frame is invalid")
+        try:
+            size = int(data[index:colon])
+        except ValueError as error:
+            raise ValueError("command frame is invalid") from error
+        if size < 0 or size > 2000:
+            raise ValueError("command frame is invalid")
+        start = colon + 1
+        end = start + size
+        if end >= len(data) or data[end : end + 1] != b",":
+            raise ValueError("command frame is invalid")
+        args.append(data[start:end].decode("utf-8"))
+        index = end + 1
+    return args
+
+
+def write_command_pid(player):
+    pid = os.getpid()
+    start = player.process_start(pid)
+    if start is None:
+        return
+    script_mtime = int(Path(__file__).stat().st_mtime)
+    temporary = player.runtime / f"player-command.{pid}.tmp"
+    temporary.write_text(f"{pid} {start} {script_mtime}\n")
+    os.chmod(temporary, 0o600)
+    temporary.replace(player.runtime / "player-command.pid")
+
+
+def handle(player, conn):
+    conn.settimeout(5)
+    try:
+        args = parse_command(read_command(conn))
+    except (ValueError, UnicodeError, TimeoutError):
+        try:
+            conn.sendall(b"2\n")
+        except OSError:
+            return
+        return
+    conn.settimeout(None)
+    reply = conn.makefile("w", encoding="utf-8")
+    player.reply = reply
+    code = 4
+    try:
+        code = dispatch(player, args)
+    except Exception:
+        try:
+            player.emit(player.snapshot("playback"))
+        except Exception:
+            pass
+    finally:
+        try:
+            if player.reply is not None:
+                player.reply.write(f"{code}\n")
+                player.reply.flush()
+        except OSError:
+            pass
+        player.reply = None
+        reply.close()
+
+
+def serve():
+    player = Player()
+    path = player.runtime / "player.cmd.sock"
+    path.unlink(missing_ok=True)
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(path))
+    os.chmod(path, 0o600)
+    listener.listen(8)
+    write_command_pid(player)
+
+    def shutdown(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        while True:
+            try:
+                conn, _addr = listener.accept()
+            except OSError:
+                break
+            try:
+                handle(player, conn)
+            finally:
+                conn.close()
+    finally:
+        listener.close()
+        path.unlink(missing_ok=True)
+        try:
+            (player.runtime / "player-command.pid").unlink()
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        serve()
+    except BrokenPipeError:
+        sys.exit(0)

@@ -3,10 +3,12 @@
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -31,7 +33,28 @@ class SandboxPlayback(unittest.TestCase):
 
     def tearDown(self):
         subprocess.run([str(PLAYER), "stop"], env=self.env, check=False, capture_output=True, text=True)
+        self.stop_command_process()
         self.temp.cleanup()
+
+    def stop_command_process(self):
+        pid_file = self.runtime / "mattia.radio" / "player-command.pid"
+        try:
+            pid = int(pid_file.read_text().split()[0])
+        except (OSError, ValueError):
+            return
+        command = Path(f"/proc/{pid}/cmdline").read_bytes() if Path(f"/proc/{pid}/cmdline").exists() else b""
+        if b"radio-playerd" not in command:
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return
+            time.sleep(0.02)
 
     def run_player(self, *args, timeout=20):
         completed = subprocess.run(
@@ -44,6 +67,17 @@ class SandboxPlayback(unittest.TestCase):
         )
         status = json.loads(completed.stdout)
         return completed.returncode, status
+
+    def test_command_process_is_reused(self):
+        code, status = self.run_player("status")
+        self.assertEqual(code, 0)
+        self.assertFalse(status["running"])
+        pid_file = self.runtime / "mattia.radio" / "player-command.pid"
+        first = pid_file.read_text()
+        code, status = self.run_player("status")
+        self.assertEqual(code, 0)
+        self.assertEqual(pid_file.read_text(), first)
+        self.assertFalse((self.runtime / "mattia.radio" / "player.pid").exists())
 
     def test_literal_loopback_never_starts_the_player(self):
         code, status = self.run_player("play", STATION, "Loop", "http://127.0.0.1:9/stream")

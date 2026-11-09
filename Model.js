@@ -333,6 +333,24 @@ function findStation(stations, favorites, id) {
   return null
 }
 
+// The row after the current id, wrapping to the first. An id that is not in
+// the list starts at the first row. An empty list has no next row.
+function nextInCircle(rows, currentId) {
+  if (!rows || !rows.length) return null
+  var index = -1
+  var key = stationId(currentId)
+  var scan = Math.min(rows.length, SCAN_CAP)
+  if (key) {
+    for (var i = 0; i < scan; i++) {
+      if (rows[i] && rows[i].id === key) {
+        index = i
+        break
+      }
+    }
+  }
+  return rows[(index + 1) % rows.length]
+}
+
 function longestField(left, right, field) {
   var best = ""
   function scan(rows) {
@@ -377,6 +395,7 @@ if (typeof module !== "undefined") {
     fetchCommand: fetchCommand,
     parsePlayerStatus: parsePlayerStatus,
     findStation: findStation,
+    nextInCircle: nextInCircle,
     longestField: longestField,
     tooltipText: tooltipText
   }

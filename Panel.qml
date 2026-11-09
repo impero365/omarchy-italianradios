@@ -16,8 +16,23 @@ Panel {
   id: root
   moduleName: "mattia.radio"
   ipcTarget: "mattia.radio"
+  // This panel owns the handler so start/stop and next-favorite can share it
+  // with open and close. A second handler for the same target is ignored.
+  manageIpc: false
 
   Commons.Translations { id: strings; directory: Qt.resolvedUrl("i18n") }
+
+  ShellIpc {
+    target: root.ipcTarget
+
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function show(): void { root.open() }
+    function hide(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function power(): string { return root.power() }
+    function next(): string { return root.nextFavorite() }
+  }
 
   readonly property string radioGlyph: "󰐹"
   readonly property string starOnGlyph: String.fromCodePoint(0xF04CE)
@@ -115,6 +130,8 @@ Panel {
 
   property string playingId: ""
   property string playingName: ""
+  // Kept after stop, so the start key can play this station again.
+  property var lastStation: null
   // Same directory row the lists use, so the player can show its icon and region.
   readonly property var playingStation: Model.findStation(stations, favorites, playingId)
   readonly property string playingIcon: playingStation && playingStation.icon ? playingStation.icon : ""
@@ -209,6 +226,7 @@ Panel {
   }
 
   function syncFavoriteSnapshots() {
+    if (lastStation && lastStation.id) rememberStation(lastStation.id, lastStation.name)
     if (!favoritesReady || favorites.length === 0) return
     var next = Model.resolveFavorites(favorites, stations)
     if (Model.favoritesPayload(next) === Model.favoritesPayload(favorites)) return
@@ -348,7 +366,10 @@ Panel {
       playerReason = ""
       return
     }
-    if (status.id) playingId = status.id
+    if (status.id) {
+      playingId = status.id
+      root.rememberStation(status.id, status.name)
+    }
     if (status.name) playingName = status.name
     paused = status.paused
     playerActive = status.running && !status.error && (!status.idle || status.starting)
@@ -380,24 +401,72 @@ Panel {
     statusProc.running = true
   }
 
+  function rememberStation(id, name) {
+    var found = Model.findStation(stations, favorites, id)
+    if (found) {
+      lastStation = found
+      return
+    }
+    if (lastStation && lastStation.id === id && lastStation.stream) return
+    if (id) lastStation = { id: id, name: name || "", stream: "" }
+  }
+
+  function playStation(station) {
+    if (!station) return false
+    var resolved = Model.findStation(stations, favorites, station.id) || station
+    if (!Model.streamUrl(resolved.stream)) {
+      playbackError = true
+      playerReason = "playback"
+      return false
+    }
+    playbackError = false
+    playerReason = ""
+    paused = false
+    playerActive = true
+    playingId = resolved.id
+    playingName = resolved.name
+    lastStation = resolved
+    runPlayer([playerPath, "play", resolved.id, resolved.name, resolved.stream])
+    return true
+  }
+
+  // Stop a running player, including while it is paused. Start the last
+  // station, or the first favorite when nothing has played yet.
+  function power() {
+    if (playerActive) {
+      playerActive = false
+      paused = false
+      runPlayer([playerPath, "stop"])
+      return "stopped"
+    }
+    var station = lastStation
+    if (station && station.id) {
+      var live = Model.findStation(stations, favorites, station.id)
+      if (live) station = live
+    }
+    if (!station || !Model.streamUrl(station.stream)) {
+      var saved = shownFavorites
+      station = saved && saved.length ? saved[0] : null
+    }
+    return playStation(station) ? "started" : "no-station"
+  }
+
+  // The favorite after the one that is playing. The row after the last is
+  // the first. A station that is not a favorite starts at the first.
+  function nextFavorite() {
+    var rows = shownFavorites || []
+    if (!rows.length) return "no-favorites"
+    var current = playingId || (lastStation && lastStation.id) || ""
+    return playStation(Model.nextInCircle(rows, current)) ? "ok" : "no-station"
+  }
+
   function toggleStation(station) {
     if (!station) return
     if (station.id === playingId && playerActive) {
       togglePause()
       return
     }
-    if (!Model.streamUrl(station.stream)) {
-      playbackError = true
-      playerReason = "playback"
-      return
-    }
-    playbackError = false
-    playerReason = ""
-    paused = false
-    playerActive = true
-    playingId = station.id
-    playingName = station.name
-    runPlayer([playerPath, "play", station.id, station.name, station.stream])
+    playStation(station)
   }
 
   function togglePause() {

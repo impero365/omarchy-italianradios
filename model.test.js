@@ -146,6 +146,20 @@ test("the playing station is the directory row, then a saved favorite", function
   assert.equal(Model.findStation([live], [saved], ""), null)
 })
 
+test("the next favorite wraps around the list", function() {
+  var rows = [
+    { id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", name: "A" },
+    { id: "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", name: "B" },
+    { id: UUID, name: "C" }
+  ]
+  assert.equal(Model.nextInCircle(rows, rows[0].id).name, "B")
+  assert.equal(Model.nextInCircle(rows, UUID).name, "A")
+  assert.equal(Model.nextInCircle(rows, "").name, "A")
+  assert.equal(Model.nextInCircle(rows, "not-an-id").name, "A")
+  assert.equal(Model.nextInCircle([], rows[0].id), null)
+  assert.equal(Model.nextInCircle(null, rows[0].id), null)
+})
+
 test("row height follows the longest name and region", function() {
   var stations = [{ name: "Radio Capital", region: "Lazio" }, { name: "A", region: "" }]
   var favorites = [{ name: "Free Radio Conselve", region: "Veneto" }]

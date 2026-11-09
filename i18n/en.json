@@ -3,7 +3,7 @@
   "tooltip.playing": "Playing %1",
   "panel.title": "Italian radios",
   "panel.filter": "Filter by name",
-  "panel.region": "Filter by region",
+  "panel.region": "Filter by region/city",
   "panel.favorites": "Favorites",
   "panel.favoritesEmpty": "Star a station to keep it in this section.",
   "panel.favoriteAdd": "Save favorite",

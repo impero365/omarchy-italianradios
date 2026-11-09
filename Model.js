@@ -315,6 +315,24 @@ function parsePlayerStatus(raw) {
   return null
 }
 
+// The directory row wins, so the player shows the same name, region, and
+// icon as the station list. A saved favorite covers a station the directory
+// has not loaded yet.
+function findStation(stations, favorites, id) {
+  var key = stationId(id)
+  if (!key) return null
+  var lists = [stations, favorites]
+  for (var n = 0; n < lists.length; n++) {
+    var rows = lists[n]
+    if (!rows || !rows.length) continue
+    var scan = Math.min(rows.length, SCAN_CAP)
+    for (var i = 0; i < scan; i++) {
+      if (rows[i] && rows[i].id === key) return rows[i]
+    }
+  }
+  return null
+}
+
 function longestField(left, right, field) {
   var best = ""
   function scan(rows) {
@@ -358,6 +376,7 @@ if (typeof module !== "undefined") {
     directoryUrl: directoryUrl,
     fetchCommand: fetchCommand,
     parsePlayerStatus: parsePlayerStatus,
+    findStation: findStation,
     longestField: longestField,
     tooltipText: tooltipText
   }

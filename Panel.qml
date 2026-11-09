@@ -56,6 +56,14 @@ Panel {
   }
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.45)
+  // Brighter than list text, in the theme accent hue, so the station in the
+  // player reads at a glance. A light panel uses a darker shade of that hue.
+  readonly property color playingTitleColor: {
+    var bg = Commons.Color.background
+    var dark = (bg.r * 0.2126 + bg.g * 0.7152 + bg.b * 0.0722) < 0.5
+    var hue = Commons.Color.accent.hslHue
+    return dark ? Qt.hsla(hue, 0.55, 0.90, 1) : Qt.hsla(hue, 0.65, 0.28, 1)
+  }
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color hoverFill: bar ? Style.hoverFillFor(foreground, Commons.Color.accent) : "transparent"
   readonly property color selectedFill: bar ? Style.selectedFillFor(foreground, Commons.Color.accent) : "transparent"
@@ -107,6 +115,10 @@ Panel {
 
   property string playingId: ""
   property string playingName: ""
+  // Same directory row the lists use, so the player can show its icon and region.
+  readonly property var playingStation: Model.findStation(stations, favorites, playingId)
+  readonly property string playingIcon: playingStation && playingStation.icon ? playingStation.icon : ""
+  readonly property string playingRegion: playingStation && playingStation.region ? playingStation.region : ""
   property bool paused: false
   property bool playerActive: false
   property bool playbackError: false
@@ -764,44 +776,148 @@ Panel {
               anchors.top: parent.top
               anchors.left: parent.left
               anchors.right: parent.right
-              implicitHeight: playerRow.implicitHeight + Style.space(16)
-              height: implicitHeight
+              // The card shares the top and bottom of the name and region filters.
+              height: nameFilter.implicitHeight + stationColumn.spacing + regionFilter.implicitHeight
               radius: Style.cornerRadius
               color: "transparent"
               borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
               padding: Style.space(8)
 
-              Row {
-                id: playerRow
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
+              Item {
+                id: playerFace
+                anchors.fill: parent
                 anchors.leftMargin: playerCard.contentLeftInset
                 anchors.rightMargin: playerCard.contentRightInset
-                spacing: Style.space(8)
+                anchors.topMargin: playerCard.contentTopInset
+                anchors.bottomMargin: playerCard.contentBottomInset
 
-                Text {
-                  width: Math.max(0, parent.width - playButton.width - parent.spacing)
-                  wrapMode: Text.WordWrap
-                  maximumLineCount: 2
-                  elide: Text.ElideRight
-                  textFormat: Text.PlainText
-                  text: root.playingName === ""
-                    ? strings.t("panel.playerIdle")
-                    : (root.paused ? strings.t("panel.paused") : strings.t("panel.playing")).arg(root.playingName)
-                  color: root.foreground
-                  font.family: root.fontFamily
-                  font.pixelSize: Style.font.body
+                Item {
+                  id: playerIcon
+                  width: Style.space(28)
+                  height: Style.space(28)
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  implicitWidth: width
+                  implicitHeight: height
+
+                  Loader {
+                    id: playerLogo
+                    anchors.fill: parent
+                    active: root.playingIcon !== ""
+                    sourceComponent: SizedImage {
+                      anchors.fill: parent
+                      asynchronous: true
+                      url: root.playingIcon
+                    }
+                    readonly property bool shown: item && item.status === Image.Ready
+                  }
+
+                  Text {
+                    anchors.centerIn: parent
+                    visible: !playerLogo.shown
+                    textFormat: Text.PlainText
+                    text: root.radioGlyph
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.heading
+                  }
                 }
 
-                PanelActionButton {
+                Item {
+                  id: playerNames
+                  anchors.left: playerIcon.right
+                  anchors.leftMargin: Style.space(8)
+                  anchors.right: playButton.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.top: parent.top
+                  anchors.bottom: parent.bottom
+                  clip: true
+
+                  Column {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(1)
+                    visible: root.playingName !== ""
+
+                    Text {
+                      width: parent.width
+                      textFormat: Text.PlainText
+                      wrapMode: Text.Wrap
+                      maximumLineCount: 2
+                      elide: Text.ElideRight
+                      text: root.playingStation && root.playingStation.name ? root.playingStation.name : root.playingName
+                      color: root.playingTitleColor
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.title
+                    }
+
+                    Text {
+                      width: parent.width
+                      visible: root.playingRegion !== ""
+                      height: visible ? implicitHeight : 0
+                      textFormat: Text.PlainText
+                      wrapMode: Text.NoWrap
+                      elide: Text.ElideRight
+                      text: root.playingRegion
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+                  }
+
+                  Text {
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: root.playingName === ""
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    text: strings.t("panel.playerIdle")
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.title
+                  }
+                }
+
+                BorderSurface {
                   id: playButton
-                  enabled: root.playerActive || (root.selectedIndex >= 0 && root.selectedIndex < root.filtered.length)
-                  iconText: (!root.playerActive || root.paused) ? root.playGlyph : root.pauseGlyph
-                  tooltipText: (!root.playerActive || root.paused) ? strings.t("panel.play") : strings.t("panel.pause")
-                  foreground: root.foreground
-                  fontFamily: root.fontFamily
-                  onClicked: root.togglePause()
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  readonly property bool playable: root.playerActive || (root.selectedIndex >= 0 && root.selectedIndex < root.filtered.length)
+                  readonly property string glyph: (!root.playerActive || root.paused) ? root.playGlyph : root.pauseGlyph
+                  height: Math.min(playerFace.height, nameFilter.implicitHeight)
+                  width: height
+                  radius: width / 2
+                  color: !playable ? Qt.alpha(Commons.Color.accent, 0.4)
+                    : playMouse.pressed ? Qt.darker(Commons.Color.accent, 1.25)
+                    : playMouse.containsMouse ? Qt.darker(Commons.Color.accent, 1.12)
+                    : Commons.Color.accent
+                  borderSpec: Border.none()
+
+                  Text {
+                    anchors.centerIn: parent
+                    textFormat: Text.PlainText
+                    text: playButton.glyph
+                    color: playButton.playable ? "#000000" : Qt.rgba(0, 0, 0, 0.45)
+                    font.family: root.fontFamily
+                    font.pixelSize: Math.round(playButton.height * 0.46)
+                  }
+
+                  MouseArea {
+                    id: playMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    enabled: playButton.playable
+                    cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                    onClicked: root.togglePause()
+                  }
+
+                  PanelToolTip {
+                    visible: playMouse.containsMouse
+                    text: (!root.playerActive || root.paused) ? strings.t("panel.play") : strings.t("panel.pause")
+                    fontFamily: root.fontFamily
+                  }
                 }
               }
             }

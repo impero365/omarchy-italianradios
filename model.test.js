@@ -122,6 +122,30 @@ test("player status accepts one status object and drops anything else", function
   assert.equal(Model.parsePlayerStatus(""), null)
 })
 
+test("the playing station is the directory row, then a saved favorite", function() {
+  var live = {
+    id: UUID,
+    name: "Radio Capital",
+    region: "Lazio",
+    stream: "https://example.test/capital",
+    icon: "https://cdn.example.test/live.png"
+  }
+  var saved = {
+    id: UUID,
+    name: "Radio Capital",
+    region: "Old",
+    stream: "https://example.test/capital",
+    icon: "https://cdn.example.test/saved.png"
+  }
+  var found = Model.findStation([live], [saved], UUID)
+  assert.equal(found.icon, "https://cdn.example.test/live.png")
+  assert.equal(found.region, "Lazio")
+  var fallback = Model.findStation([], [saved], UUID.toUpperCase())
+  assert.equal(fallback.icon, "https://cdn.example.test/saved.png")
+  assert.equal(Model.findStation([live], [saved], "not-an-id"), null)
+  assert.equal(Model.findStation([live], [saved], ""), null)
+})
+
 test("row height follows the longest name and region", function() {
   var stations = [{ name: "Radio Capital", region: "Lazio" }, { name: "A", region: "" }]
   var favorites = [{ name: "Free Radio Conselve", region: "Veneto" }]

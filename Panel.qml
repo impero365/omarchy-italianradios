@@ -152,6 +152,9 @@ Panel {
   readonly property string playingRegion: playingStation && playingStation.region ? playingStation.region : ""
   property bool paused: false
   property bool playerActive: false
+  // True from the click until this station's stream is actually open.
+  property bool connecting: false
+  property real connectingPhase: 0
   property bool playbackError: false
   property string playerReason: ""
   property int volume: 100
@@ -382,6 +385,7 @@ Panel {
         playbackError = true
         playerReason = "playback"
         playerActive = false
+        connecting = false
       }
       return
     }
@@ -390,6 +394,7 @@ Panel {
       playingName = ""
       paused = false
       playerActive = false
+      connecting = false
       playbackError = false
       playerReason = ""
       return
@@ -401,6 +406,7 @@ Panel {
     if (status.name) playingName = status.name
     paused = status.paused
     playerActive = status.running && !status.error && (!status.idle || status.starting)
+    connecting = playerActive && status.starting === true
     playbackError = status.error || (failed && !playerActive)
     playerReason = playbackError ? (status.reason || "playback") : ""
   }
@@ -410,6 +416,7 @@ Panel {
       playbackError = true
       playerReason = "no-player"
       playerActive = false
+      connecting = false
       return
     }
     if (playerAction.running) {
@@ -472,6 +479,7 @@ Panel {
     playerReason = ""
     paused = false
     playerActive = true
+    connecting = true
     playingId = resolved.id
     playingName = resolved.name
     requestedId = resolved.id
@@ -485,6 +493,7 @@ Panel {
   function power() {
     if (playerActive) {
       playerActive = false
+      connecting = false
       paused = false
       runPlayer([playerPath, "stop"])
       return "stopped"
@@ -723,6 +732,39 @@ Panel {
     id: wheelIdle
     interval: 180
     onTriggered: root.wheelScrolling = false
+  }
+
+  NumberAnimation on connectingPhase {
+    from: 0
+    to: Math.PI * 2
+    duration: Style.duration(900)
+    loops: Animation.Infinite
+    running: root.connecting && Style.duration(1) > 0
+  }
+
+  // Three dim circles. One shared phase walks the bright spot left to right.
+  // With animations off the dots stay at a steady dim opacity.
+  component ConnectingDots: Row {
+    id: dots
+    property bool shown: false
+
+    spacing: Style.space(3)
+    visible: shown
+    Repeater {
+      model: 3
+      delegate: Rectangle {
+        required property int index
+        width: Style.space(4)
+        height: width
+        radius: width / 2
+        color: root.foreground
+        opacity: {
+          if (Style.duration(1) === 0) return 0.4
+          var wave = Math.sin(root.connectingPhase - index * 0.9)
+          return 0.18 + 0.82 * Math.pow(Math.max(0, wave), 1.4)
+        }
+      }
+    }
   }
 
   component FilterField: Item {
@@ -1038,7 +1080,8 @@ Panel {
                   readonly property string glyph: (!root.playerActive || root.paused) ? root.playGlyph : root.pauseGlyph
                   height: Math.min(playerFace.height, nameFilter.implicitHeight)
                   width: height
-                  radius: width / 2
+                  // A rounded square. Half the width would make a circle.
+                  radius: Math.round(width * 0.22)
                   color: !playable ? Qt.alpha(Commons.Color.accent, 0.4)
                     : playMouse.pressed ? Qt.darker(Commons.Color.accent, 1.25)
                     : playMouse.containsMouse ? Qt.darker(Commons.Color.accent, 1.12)
@@ -1245,13 +1288,19 @@ Panel {
                 anchors.left: savedIcon.right
                 anchors.leftMargin: Style.space(8)
                 anchors.right: savedStar.left
+                // The dots take the end of a full-width name. Keep the line
+                // count from the full width and shorten the last line.
+                anchors.rightMargin: savedDots.shown ? savedDots.implicitWidth + Style.space(8) : 0
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(1)
 
                 Text {
+                  id: savedName
                   width: parent.width
                   textFormat: Text.PlainText
                   wrapMode: Text.Wrap
+                  maximumLineCount: savedDots.shown ? Math.max(1, savedNameFull.lineCount) : 100
+                  elide: savedDots.shown ? Text.ElideRight : Text.ElideNone
                   text: savedRow.modelData.name
                   color: root.foreground
                   font.family: root.fontFamily
@@ -1259,9 +1308,23 @@ Panel {
                 }
 
                 Text {
+                  id: savedNameFull
+                  visible: false
+                  width: savedNames.width + savedNames.anchors.rightMargin
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: savedName.text
+                  font.family: savedName.font.family
+                  font.pixelSize: savedName.font.pixelSize
+                }
+
+                Text {
+                  id: savedRegion
                   width: parent.width
                   textFormat: Text.PlainText
                   wrapMode: Text.Wrap
+                  maximumLineCount: savedDots.shown ? Math.max(1, savedRegionFull.lineCount) : 100
+                  elide: savedDots.shown ? Text.ElideRight : Text.ElideNone
                   visible: savedRow.modelData.region !== ""
                   height: visible ? implicitHeight : 0
                   text: savedRow.modelData.region
@@ -1269,6 +1332,26 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
+
+                Text {
+                  id: savedRegionFull
+                  visible: false
+                  width: savedNameFull.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: savedRegion.text
+                  font.family: savedRegion.font.family
+                  font.pixelSize: savedRegion.font.pixelSize
+                }
+              }
+
+              ConnectingDots {
+                id: savedDots
+                anchors.right: savedStar.left
+                anchors.rightMargin: Style.space(4)
+                anchors.verticalCenter: parent.verticalCenter
+                z: 2
+                shown: root.connecting && savedRow.modelData.id === root.playingId
               }
 
               PanelActionButton {
@@ -1413,13 +1496,19 @@ Panel {
                 anchors.left: iconBox.right
                 anchors.leftMargin: Style.space(8)
                 anchors.right: starButton.left
+                // The dots take the end of a full-width name. Keep the line
+                // count from the full width and shorten the last line.
+                anchors.rightMargin: rowDots.shown ? rowDots.implicitWidth + Style.space(8) : 0
                 anchors.verticalCenter: parent.verticalCenter
                 spacing: Style.space(1)
 
                 Text {
+                  id: stationName
                   width: parent.width
                   textFormat: Text.PlainText
                   wrapMode: Text.Wrap
+                  maximumLineCount: rowDots.shown ? Math.max(1, stationNameFull.lineCount) : 100
+                  elide: rowDots.shown ? Text.ElideRight : Text.ElideNone
                   text: row.modelData.name
                   color: root.foreground
                   font.family: root.fontFamily
@@ -1427,9 +1516,23 @@ Panel {
                 }
 
                 Text {
+                  id: stationNameFull
+                  visible: false
+                  width: names.width + names.anchors.rightMargin
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: stationName.text
+                  font.family: stationName.font.family
+                  font.pixelSize: stationName.font.pixelSize
+                }
+
+                Text {
+                  id: stationRegion
                   width: parent.width
                   textFormat: Text.PlainText
                   wrapMode: Text.Wrap
+                  maximumLineCount: rowDots.shown ? Math.max(1, stationRegionFull.lineCount) : 100
+                  elide: rowDots.shown ? Text.ElideRight : Text.ElideNone
                   visible: row.modelData.region !== ""
                   height: visible ? implicitHeight : 0
                   text: row.modelData.region
@@ -1437,6 +1540,26 @@ Panel {
                   font.family: root.fontFamily
                   font.pixelSize: Style.font.caption
                 }
+
+                Text {
+                  id: stationRegionFull
+                  visible: false
+                  width: stationNameFull.width
+                  textFormat: Text.PlainText
+                  wrapMode: Text.Wrap
+                  text: stationRegion.text
+                  font.family: stationRegion.font.family
+                  font.pixelSize: stationRegion.font.pixelSize
+                }
+              }
+
+              ConnectingDots {
+                id: rowDots
+                anchors.right: starButton.left
+                anchors.rightMargin: Style.space(4)
+                anchors.verticalCenter: parent.verticalCenter
+                z: 2
+                shown: root.connecting && row.modelData.id === root.playingId
               }
 
               PanelActionButton {

@@ -116,6 +116,20 @@ test("player status accepts one status object and drops anything else", function
   assert.equal(status.name, "Radio Capital")
   assert.equal(status.running, true)
   assert.equal(status.idle, false)
+  assert.equal(status.seq, null)
+  var newer = Model.parsePlayerStatus(JSON.stringify({
+    running: true,
+    paused: false,
+    idle: true,
+    starting: true,
+    error: false,
+    id: "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+    name: "Radio Capital",
+    reason: "",
+    seq: 2
+  }))
+  assert.equal(newer.seq, 2)
+  assert.equal(newer.starting, true)
   assert.equal(Model.parsePlayerStatus('{"running":true,"name":"<img>"}'), null)
   assert.equal(Model.parsePlayerStatus('{"running":true,"reason":"shell"}'), null)
   assert.equal(Model.parsePlayerStatus("not json"), null)

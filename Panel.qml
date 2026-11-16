@@ -141,6 +141,9 @@ Panel {
 
   property string playingId: ""
   property string playingName: ""
+  // Station from the latest click. An older start's status is ignored.
+  property string requestedId: ""
+  property int playerSeq: -1
   // Kept after stop, so the start key can play this station again.
   property var lastStation: null
   // Same directory row the lists use, so the player can show its icon and region.
@@ -362,8 +365,12 @@ Panel {
     toggleStation(filtered[selectedIndex])
   }
 
-  function applyPlayerStatus(raw, failed) {
+  function applyPlayerStatus(raw, failed, fromCommand) {
     var status = Model.parsePlayerStatus(raw)
+    if (status && status.seq !== null && root.playerSeq > status.seq) return
+    if (status && !fromCommand && root.requestedId && status.id !== root.requestedId) return
+    if (status && status.seq !== null) root.playerSeq = status.seq
+    if (status && fromCommand) root.requestedId = ""
     if (status && status.volume !== null && !volumeDragging) {
       if (volumeTarget < 0 || status.volume === volumeTarget) {
         volumeTarget = -1
@@ -467,6 +474,7 @@ Panel {
     playerActive = true
     playingId = resolved.id
     playingName = resolved.name
+    requestedId = resolved.id
     lastStation = resolved
     runPlayer([playerPath, "play", resolved.id, resolved.name, resolved.stream])
     return true
@@ -652,9 +660,13 @@ Panel {
       var failed = code !== 0
       playerAction.queued = null
       // The collector writes the output after this signal. Apply it on the next turn.
+      // A queued station is the newer click, so this command's status is skipped.
       Qt.callLater(function() {
-        root.applyPlayerStatus(playerAction.output, failed)
-        if (queued) root.runPlayer(queued)
+        if (queued) {
+          root.runPlayer(queued)
+          return
+        }
+        root.applyPlayerStatus(playerAction.output, failed, true)
       })
     }
   }

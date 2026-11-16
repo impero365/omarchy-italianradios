@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """The player reaches streams only through the public-address proxy."""
 
+import importlib.machinery
+import importlib.util
+import io
 import json
 import os
 import signal
@@ -15,6 +18,7 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parents[1]
 PLAYER = PLUGIN / "radio-player"
 STATION = "11111111-1111-4111-8111-111111111111"
+OTHER = "22222222-2222-4222-8222-222222222222"
 
 
 class SandboxPlayback(unittest.TestCase):
@@ -110,9 +114,12 @@ class SandboxPlayback(unittest.TestCase):
             code, status = self.run_player(
                 "play", STATION, "Loop", f"http://localhost:{port}/stream", timeout=20
             )
+            deadline = time.time() + 8
+            while time.time() < deadline and not status["error"]:
+                time.sleep(0.2)
+                code, status = self.run_player("status")
         finally:
             server.close()
-        self.assertNotEqual(code, 0)
         self.assertTrue(status["error"])
         self.assertFalse(status["running"] and not status["idle"] and not status["error"])
         log = (self.runtime / "impero365.radio-italia" / "proxy.log").read_text()
@@ -122,6 +129,55 @@ class SandboxPlayback(unittest.TestCase):
         code, status = self.run_player("stop")
         self.assertEqual(code, 0)
         self.assertFalse(status["running"])
+
+    def test_second_station_is_sent_before_the_first_stream_opens(self):
+        previous = os.environ.get("XDG_RUNTIME_DIR")
+        os.environ["XDG_RUNTIME_DIR"] = str(self.runtime)
+        listener = None
+        try:
+            loader = importlib.machinery.SourceFileLoader(
+                "radio_playerd", str(PLUGIN / "radio-playerd")
+            )
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            playerd = importlib.util.module_from_spec(spec)
+            loader.exec_module(playerd)
+            player = playerd.Player()
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            listener.bind(str(player.socket_path))
+            calls = []
+
+            def ipc(payload, timeout=3):
+                command = payload.get("command") or []
+                if command and command[0] == "loadfile":
+                    calls.append(command[1])
+                return {"error": "success", "data": None}
+
+            player.tools_ready = lambda: True
+            player.ensure = lambda: True
+            player.alive = lambda: True
+            player.ipc = ipc
+            player.reply = io.StringIO()
+            started = time.monotonic()
+            slow = playerd.play(player, STATION, "Slow", "https://slow.example/slow")
+            fast = playerd.play(player, OTHER, "Fast", "https://fast.example/fast")
+            elapsed = time.monotonic() - started
+        finally:
+            if listener is not None:
+                listener.close()
+            if previous is None:
+                os.environ.pop("XDG_RUNTIME_DIR", None)
+            else:
+                os.environ["XDG_RUNTIME_DIR"] = previous
+        self.assertEqual(slow, 0)
+        self.assertEqual(fast, 0)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(calls, ["https://slow.example/slow", "https://fast.example/fast"])
+        lines = player.reply.getvalue().strip().splitlines()
+        first = json.loads(lines[0])
+        last = json.loads(lines[-1])
+        self.assertEqual(last["id"], OTHER)
+        self.assertTrue(last["starting"])
+        self.assertGreater(last["seq"], first["seq"])
 
     def test_sandbox_can_open_the_audio_device(self):
         session = PLUGIN / "radio-session"

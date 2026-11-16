@@ -304,6 +304,9 @@ function parsePlayerStatus(raw) {
     var volume = null
     if (typeof data.volume === "number" && data.volume >= 0 && data.volume <= 100)
       volume = Math.round(data.volume)
+    var seq = null
+    if (typeof data.seq === "number" && isFinite(data.seq) && data.seq >= 0 && data.seq <= 1e15)
+      seq = Math.round(data.seq)
     return {
       running: data.running === true,
       paused: data.paused === true,
@@ -313,7 +316,8 @@ function parsePlayerStatus(raw) {
       id: id,
       name: name,
       reason: reason,
-      volume: volume
+      volume: volume,
+      seq: seq
     }
   }
   return null

@@ -4,7 +4,9 @@
 radio-player is the short command the panel runs. It forwards each request
 here. This process stays up, so a later click does not start Python again.
 The first play starts radio-session. Later plays send loadfile to that mpv.
-Stop ends the mpv session and leaves this process running.
+A play returns once mpv has accepted the station, so the next click can
+replace it before a slow stream opens. Stop ends the mpv session and leaves
+this process running.
 """
 
 import fcntl
@@ -19,6 +21,7 @@ import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -171,6 +174,7 @@ class Player:
             "seen": data.get("seen") is True,
             "logOffset": data.get("logOffset") if isinstance(data.get("logOffset"), int) else 0,
             "proxyOffset": data.get("proxyOffset") if isinstance(data.get("proxyOffset"), int) else 0,
+            "seq": data.get("seq") if isinstance(data.get("seq"), int) and not isinstance(data.get("seq"), bool) and data["seq"] >= 0 else 0,
         }
 
     def write_meta(self, **fields):
@@ -329,6 +333,7 @@ class Player:
             "volume": self.current_volume(running),
             "error": error,
             "reason": reason if error else "",
+            "seq": meta["seq"],
         }
 
     def read_gain(self):
@@ -358,16 +363,20 @@ class Player:
                     return level
         return self.gain
 
-    def emit(self, status):
-        payload = json.dumps(status, separators=(",", ":"))
+    def write_playback(self, status):
         # The bar reads this after a plugin reload. The panel's own memory is gone then.
+        payload = json.dumps(status, separators=(",", ":"))
         try:
-            temporary = self.runtime / f".playback-{os.getpid()}.tmp"
+            temporary = self.runtime / f".playback-{os.getpid()}-{threading.get_ident()}.tmp"
             temporary.write_text(payload + "\n")
             os.chmod(temporary, 0o600)
             temporary.replace(self.runtime / "playback.json")
         except OSError:
             pass
+
+    def emit(self, status):
+        self.write_playback(status)
+        payload = json.dumps(status, separators=(",", ":"))
         stream = self.reply if self.reply is not None else sys.stdout
         stream.write(payload + "\n")
         stream.flush()
@@ -413,7 +422,11 @@ def clean_name(name):
 
 def play(player, station_id, name, url):
     if not UUID.match(station_id or "") or not stream_allowed(url):
-        player.emit(player.snapshot("playback"))
+        player.lock()
+        try:
+            player.emit(player.snapshot("playback"))
+        finally:
+            player.unlock()
         return 3
     title = clean_name(name)
     if not title:
@@ -438,6 +451,9 @@ def play(player, station_id, name, url):
             return 4
         offset = player.mpv_log.stat().st_size if player.mpv_log.exists() else 0
         proxy_offset = player.proxy_log.stat().st_size if player.proxy_log.exists() else 0
+        # Waiting for audio here blocks the next click. A slow stream would
+        # then start even though a faster station was already chosen.
+        meta = player.read_meta()
         player.write_meta(
             id=station_id,
             name=title,
@@ -445,6 +461,7 @@ def play(player, station_id, name, url):
             seen=False,
             logOffset=offset,
             proxyOffset=proxy_offset,
+            seq=meta["seq"] + 1,
         )
         try:
             reply = player.ipc({
@@ -467,27 +484,11 @@ def play(player, station_id, name, url):
         except (OSError, json.JSONDecodeError):
             player.emit(player.snapshot("playback"))
             return 4
-    finally:
-        player.unlock()
-
-    deadline = time.time() + START_GRACE_S
-    while time.time() < deadline:
-        player.lock()
-        try:
-            status = player.snapshot()
-        finally:
-            player.unlock()
-        if not status["running"] or status["error"] or not status["idle"]:
-            player.emit(status)
-            return 0 if status["running"] and not status["error"] else 4
-        time.sleep(0.1)
-    player.lock()
-    try:
         status = player.snapshot()
+        player.emit(status)
+        return 0 if status["running"] and not status["error"] else 4
     finally:
         player.unlock()
-    player.emit(status)
-    return 0 if status["running"] and not status["error"] else 4
 
 
 def set_pause(player, paused):
@@ -505,10 +506,10 @@ def set_pause(player, paused):
             player.emit(player.snapshot("playback"))
             return 4
         status = player.snapshot()
+        player.emit(status)
+        return 0
     finally:
         player.unlock()
-    player.emit(status)
-    return 0
 
 
 def toggle(player):
@@ -529,12 +530,21 @@ def stop(player):
         if not player.terminate():
             player.emit(player.snapshot("playback"))
             return 4
-        player.write_meta(id="", name="", since=0, seen=False, logOffset=0, proxyOffset=0)
+        meta = player.read_meta()
+        player.write_meta(
+            id="",
+            name="",
+            since=0,
+            seen=False,
+            logOffset=0,
+            proxyOffset=0,
+            seq=meta["seq"] + 1,
+        )
         status = player.snapshot()
+        player.emit(status)
+        return 0
     finally:
         player.unlock()
-    player.emit(status)
-    return 0
 
 
 def set_volume(player, raw):
@@ -542,12 +552,12 @@ def set_volume(player, raw):
         level = int(raw)
     except (TypeError, ValueError):
         level = -1
-    if not 0 <= level <= 100:
-        player.emit(player.snapshot("playback"))
-        return 3
-    player.write_gain(level)
     player.lock()
     try:
+        if not 0 <= level <= 100:
+            player.emit(player.snapshot("playback"))
+            return 3
+        player.write_gain(level)
         if player.alive() and player.socket_path.is_socket():
             try:
                 reply = player.ipc({"command": ["set_property", "volume", level]})
@@ -558,20 +568,19 @@ def set_volume(player, raw):
                 player.emit(player.snapshot("playback"))
                 return 4
         status = player.snapshot()
+        player.emit(status)
+        return 0
     finally:
         player.unlock()
-    player.emit(status)
-    return 0
 
 
 def status(player):
     player.lock()
     try:
-        current = player.snapshot()
+        player.emit(player.snapshot())
+        return 0
     finally:
         player.unlock()
-    player.emit(current)
-    return 0
 
 
 def dispatch(player, args):
@@ -666,10 +675,13 @@ def handle(player, conn):
     try:
         code = dispatch(player, args)
     except Exception:
+        player.lock()
         try:
             player.emit(player.snapshot("playback"))
         except Exception:
             pass
+        finally:
+            player.unlock()
     finally:
         try:
             if player.reply is not None:
@@ -681,6 +693,24 @@ def handle(player, conn):
         reply.close()
 
 
+def publish_changes(player, stop):
+    previous = ""
+    while not stop.wait(0.25):
+        player.lock()
+        try:
+            meta = player.read_meta()
+            if not player.alive() and not meta["since"]:
+                continue
+            status = player.snapshot()
+            payload = json.dumps(status, separators=(",", ":"))
+            if payload == previous:
+                continue
+            previous = payload
+            player.write_playback(status)
+        finally:
+            player.unlock()
+
+
 def serve():
     player = Player()
     path = player.runtime / "player.cmd.sock"
@@ -690,6 +720,8 @@ def serve():
     os.chmod(path, 0o600)
     listener.listen(8)
     write_command_pid(player)
+    stop = threading.Event()
+    threading.Thread(target=publish_changes, args=(player, stop), daemon=True).start()
 
     def shutdown(_signum, _frame):
         raise SystemExit(0)
@@ -708,6 +740,7 @@ def serve():
             finally:
                 conn.close()
     finally:
+        stop.set()
         listener.close()
         path.unlink(missing_ok=True)
         try:

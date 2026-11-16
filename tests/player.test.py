@@ -37,7 +37,7 @@ class SandboxPlayback(unittest.TestCase):
         self.temp.cleanup()
 
     def stop_command_process(self):
-        pid_file = self.runtime / "mattia.radio" / "player-command.pid"
+        pid_file = self.runtime / "impero365.radio-italia" / "player-command.pid"
         try:
             pid = int(pid_file.read_text().split()[0])
         except (OSError, ValueError):
@@ -72,18 +72,31 @@ class SandboxPlayback(unittest.TestCase):
         code, status = self.run_player("status")
         self.assertEqual(code, 0)
         self.assertFalse(status["running"])
-        pid_file = self.runtime / "mattia.radio" / "player-command.pid"
+        pid_file = self.runtime / "impero365.radio-italia" / "player-command.pid"
         first = pid_file.read_text()
         code, status = self.run_player("status")
         self.assertEqual(code, 0)
         self.assertEqual(pid_file.read_text(), first)
-        self.assertFalse((self.runtime / "mattia.radio" / "player.pid").exists())
+        self.assertFalse((self.runtime / "impero365.radio-italia" / "player.pid").exists())
+
+    def test_volume_is_remembered_without_starting_playback(self):
+        code, status = self.run_player("volume", "40")
+        self.assertEqual(code, 0)
+        self.assertEqual(status["volume"], 40)
+        self.assertFalse(status["running"])
+        self.assertFalse((self.runtime / "impero365.radio-italia" / "player.pid").exists())
+        code, status = self.run_player("status")
+        self.assertEqual(code, 0)
+        self.assertEqual(status["volume"], 40)
+        code, status = self.run_player("volume", "140")
+        self.assertEqual(code, 3)
+        self.assertEqual(status["volume"], 40)
 
     def test_literal_loopback_never_starts_the_player(self):
         code, status = self.run_player("play", STATION, "Loop", "http://127.0.0.1:9/stream")
         self.assertEqual(code, 3)
         self.assertFalse(status["running"])
-        self.assertFalse((self.runtime / "mattia.radio" / "player.pid").exists())
+        self.assertFalse((self.runtime / "impero365.radio-italia" / "player.pid").exists())
 
     def test_localhost_is_refused_by_the_proxy(self):
         accepted = []
@@ -102,7 +115,7 @@ class SandboxPlayback(unittest.TestCase):
         self.assertNotEqual(code, 0)
         self.assertTrue(status["error"])
         self.assertFalse(status["running"] and not status["idle"] and not status["error"])
-        log = (self.runtime / "mattia.radio" / "proxy.log").read_text()
+        log = (self.runtime / "impero365.radio-italia" / "proxy.log").read_text()
         self.assertIn("outcome=forbidden", log)
         thread.join(0.3)
         self.assertEqual(accepted, [])

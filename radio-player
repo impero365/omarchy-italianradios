@@ -7,7 +7,7 @@ set -euo pipefail
 umask 077
 
 usage() {
-  echo "usage: radio-player play ID NAME URL | pause | resume | toggle | stop | status" >&2
+  echo "usage: radio-player play ID NAME URL | pause | resume | toggle | stop | status | volume 0-100" >&2
   exit 2
 }
 
@@ -20,7 +20,7 @@ runtime_root=${XDG_RUNTIME_DIR:-}
 [[ $runtime_root == /* ]] || fail
 [[ $runtime_root != *..* ]] || fail
 [[ ! $runtime_root =~ [[:space:][:cntrl:]] ]] || fail
-runtime=${runtime_root%/}/mattia.radio
+runtime=${runtime_root%/}/impero365.radio-italia
 install -d -m 700 -- "$runtime"
 
 if [[ $# -eq 0 ]]; then
@@ -32,6 +32,9 @@ case "$1" in
     ;;
   pause|resume|toggle|stop|status)
     [[ $# -eq 1 ]] || usage
+    ;;
+  volume)
+    [[ $# -eq 2 && $2 =~ ^[0-9]+$ ]] || usage
     ;;
   *)
     usage

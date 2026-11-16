@@ -33,7 +33,7 @@ REQUIRED_TOOLS = ("mpv", "bwrap", "socat", "python3", "ip", "setpriv")
 
 def proxy_module():
     loader = importlib.machinery.SourceFileLoader(
-        "mattia_radio_proxy", str(SCRIPT_DIR / "radio-proxy")
+        "impero365_radio_italia_proxy", str(SCRIPT_DIR / "radio-proxy")
     )
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
@@ -48,7 +48,7 @@ def runtime_dir():
     raw = os.environ.get("XDG_RUNTIME_DIR", "")
     if not raw.startswith("/") or ".." in raw or any(ord(ch) < 32 or ch.isspace() for ch in raw):
         raise SystemExit("Italian radios requires a usable XDG_RUNTIME_DIR")
-    path = Path(raw) / "mattia.radio"
+    path = Path(raw) / "impero365.radio-italia"
     path.mkdir(mode=0o700, exist_ok=True)
     os.chmod(path, 0o700)
     return path
@@ -67,6 +67,7 @@ class Player:
         self.lock_file = self.runtime / "player.lock"
         self._lock_fd = os.open(self.lock_file, os.O_CREAT | os.O_RDWR, 0o600)
         self.reply = None
+        self.gain = self.read_gain()
 
     def lock(self):
         fcntl.flock(self._lock_fd, fcntl.LOCK_EX)
@@ -230,6 +231,7 @@ class Player:
             "--no-input-default-bindings",
             "--network-timeout=15",
             "--cache-secs=10",
+            f"--volume={self.gain}",
             "--http-proxy=http://127.0.0.1:18765",
             f"--input-ipc-server={self.socket_path}",
             f"--log-file={self.mpv_log}",
@@ -324,9 +326,37 @@ class Player:
             "starting": starting and running and not error,
             "id": meta["id"] if running or error else "",
             "name": meta["name"] if running or error else "",
+            "volume": self.current_volume(running),
             "error": error,
             "reason": reason if error else "",
         }
+
+    def read_gain(self):
+        try:
+            value = int((self.runtime / "volume").read_text().strip())
+        except (OSError, ValueError):
+            return 100
+        if 0 <= value <= 100:
+            return value
+        return 100
+
+    def write_gain(self, level):
+        self.gain = level
+        temporary = self.runtime / f".volume-{os.getpid()}.tmp"
+        temporary.write_text(f"{level}\n")
+        os.chmod(temporary, 0o600)
+        temporary.replace(self.runtime / "volume")
+
+    def current_volume(self, running):
+        if running:
+            current = self.property("volume")
+            if isinstance(current, (int, float)) and not isinstance(current, bool):
+                level = int(round(current))
+                if 0 <= level <= 100:
+                    if level != self.gain:
+                        self.write_gain(level)
+                    return level
+        return self.gain
 
     def emit(self, status):
         payload = json.dumps(status, separators=(",", ":"))
@@ -507,6 +537,33 @@ def stop(player):
     return 0
 
 
+def set_volume(player, raw):
+    try:
+        level = int(raw)
+    except (TypeError, ValueError):
+        level = -1
+    if not 0 <= level <= 100:
+        player.emit(player.snapshot("playback"))
+        return 3
+    player.write_gain(level)
+    player.lock()
+    try:
+        if player.alive() and player.socket_path.is_socket():
+            try:
+                reply = player.ipc({"command": ["set_property", "volume", level]})
+            except (OSError, json.JSONDecodeError):
+                player.emit(player.snapshot("playback"))
+                return 4
+            if reply.get("error") != "success":
+                player.emit(player.snapshot("playback"))
+                return 4
+        status = player.snapshot()
+    finally:
+        player.unlock()
+    player.emit(status)
+    return 0
+
+
 def status(player):
     player.lock()
     try:
@@ -531,8 +588,10 @@ def dispatch(player, args):
         return stop(player)
     if action == "status" and len(args) == 1:
         return status(player)
+    if action == "volume" and len(args) == 2:
+        return set_volume(player, args[1])
     print(
-        "usage: radio-player play ID NAME URL | pause | resume | toggle | stop | status",
+        "usage: radio-player play ID NAME URL | pause | resume | toggle | stop | status | volume 0-100",
         file=sys.stderr,
     )
     return 2

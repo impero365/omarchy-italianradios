@@ -5,7 +5,7 @@ umask 077
 
 : "${XDG_RUNTIME_DIR:?Italian radios requires XDG_RUNTIME_DIR}"
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-runtime_dir="$XDG_RUNTIME_DIR/mattia.radio"
+runtime_dir="$XDG_RUNTIME_DIR/impero365.radio-italia"
 proxy_socket="$runtime_dir/proxy.sock"
 proxy_pid=""
 sandbox_pid=""
@@ -41,6 +41,6 @@ setpriv --pdeathsig TERM bwrap --unshare-net --die-with-parent \
     set -e
     ip link set lo up
     exec setpriv --inh-caps=-net_admin --ambient-caps=-net_admin "$@"
-  ' mattia-radio "$script_dir/radio-sandbox" "$runtime_dir" "$@" &
+  ' impero365-radio-italia "$script_dir/radio-sandbox" "$runtime_dir" "$@" &
 sandbox_pid=$!
 wait "$sandbox_pid"

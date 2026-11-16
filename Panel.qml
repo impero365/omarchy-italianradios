@@ -14,8 +14,8 @@ import "Model.js" as Model
 // stream in one sandboxed mpv. The player pauses and resumes that stream.
 Panel {
   id: root
-  moduleName: "mattia.radio"
-  ipcTarget: "mattia.radio"
+  moduleName: "impero365.radio-italia"
+  ipcTarget: "impero365.radio-italia"
   // This panel owns the handler so start/stop and next-favorite can share it
   // with open and close. A second handler for the same target is ignored.
   manageIpc: false
@@ -42,7 +42,7 @@ Panel {
   readonly property string cacheDir: {
     var home = String(Quickshell.env("HOME") || "")
     if (!home || /[\u0000-\u001F]/.test(home)) return ""
-    return home + "/.cache/mattia.radio"
+    return home + "/.cache/impero365.radio-italia"
   }
   readonly property string cachePath: cacheDir !== "" ? cacheDir + "/stations.json" : ""
   readonly property string stateDir: {
@@ -52,7 +52,7 @@ Panel {
     var base = home + "/.local/state"
     if (state.charAt(0) === "/" && state.indexOf("..") === -1 && !/[\u0000-\u001F\s]/.test(state))
       base = state.replace(/\/+$/, "")
-    return base + "/mattia.radio"
+    return base + "/impero365.radio-italia"
   }
   readonly property string favoritesPath: stateDir !== "" ? stateDir + "/favorites.json" : ""
   readonly property string playerPath: {
@@ -67,7 +67,7 @@ Panel {
   readonly property string playbackPath: {
     var runtime = String(Quickshell.env("XDG_RUNTIME_DIR") || "")
     if (runtime.charAt(0) !== "/" || runtime.indexOf("..") !== -1 || /[\u0000-\u001F\s]/.test(runtime)) return ""
-    return runtime.replace(/\/+$/, "") + "/mattia.radio/playback.json"
+    return runtime.replace(/\/+$/, "") + "/impero365.radio-italia/playback.json"
   }
   readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property color dim: Qt.darker(foreground, 1.45)
@@ -78,6 +78,17 @@ Panel {
     var dark = (bg.r * 0.2126 + bg.g * 0.7152 + bg.b * 0.0722) < 0.5
     var hue = Commons.Color.accent.hslHue
     return dark ? Qt.hsla(hue, 0.55, 0.90, 1) : Qt.hsla(hue, 0.65, 0.28, 1)
+  }
+  // Title ink stays on the accent hue and steps a little toward the neighbors
+  // so the wordmark reads in color without leaving the active theme.
+  readonly property bool titleOnDark: {
+    var bg = Commons.Color.background
+    return (bg.r * 0.2126 + bg.g * 0.7152 + bg.b * 0.0722) < 0.5
+  }
+  function titleColorAt(offset) {
+    var hue = Commons.Color.accent.hslHue + offset
+    hue = hue - Math.floor(hue)
+    return titleOnDark ? Qt.hsla(hue, 0.72, 0.70, 1) : Qt.hsla(hue, 0.78, 0.36, 1)
   }
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property color hoverFill: bar ? Style.hoverFillFor(foreground, Commons.Color.accent) : "transparent"
@@ -140,6 +151,10 @@ Panel {
   property bool playerActive: false
   property bool playbackError: false
   property string playerReason: ""
+  property int volume: 100
+  // The level the bar last asked for. Status replies are ignored until one matches it.
+  property int volumeTarget: -1
+  property bool volumeDragging: false
 
   readonly property var filtered: Model.filterStations(stations, query, regionQuery)
   readonly property string statusText: {
@@ -349,6 +364,12 @@ Panel {
 
   function applyPlayerStatus(raw, failed) {
     var status = Model.parsePlayerStatus(raw)
+    if (status && status.volume !== null && !volumeDragging) {
+      if (volumeTarget < 0 || status.volume === volumeTarget) {
+        volumeTarget = -1
+        volume = status.volume
+      }
+    }
     if (!status) {
       if (failed) {
         playbackError = true
@@ -392,6 +413,27 @@ Panel {
     playerAction.errorOutput = ""
     playerAction.command = args
     playerAction.running = true
+  }
+
+  function previewVolume(level) {
+    var next = Math.max(0, Math.min(100, Math.round(level)))
+    volumeTarget = next
+    volume = next
+    volumeSend.restart()
+  }
+
+  function commitVolume() {
+    volumeSend.stop()
+    if (!playerPath) return
+    var next = Math.max(0, Math.min(100, Math.round(volume)))
+    if (volumeProc.running) {
+      volumeProc.pending = next
+      return
+    }
+    volumeProc.pending = -1
+    volumeProc.output = ""
+    volumeProc.command = [playerPath, "volume", String(next)]
+    volumeProc.running = true
   }
 
   function refreshStatus() {
@@ -586,6 +628,12 @@ Panel {
     onTriggered: root.refreshStatus()
   }
 
+  Timer {
+    id: volumeSend
+    interval: 80
+    onTriggered: root.commitVolume()
+  }
+
   Process {
     id: playerAction
     property var queued: null
@@ -626,6 +674,30 @@ Panel {
       Qt.callLater(function() {
         if (!playerAction.running && (failed || statusProc.output !== ""))
           root.applyPlayerStatus(statusProc.output, failed)
+      })
+    }
+  }
+
+  Process {
+    id: volumeProc
+    property int pending: -1
+    property string output: ""
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: volumeProc.output = text
+    }
+    onExited: function(code) {
+      var pending = volumeProc.pending
+      var output = volumeProc.output
+      volumeProc.pending = -1
+      Qt.callLater(function() {
+        if (pending >= 0) {
+          root.volume = pending
+          root.volumeTarget = pending
+          root.commitVolume()
+          return
+        }
+        if (output !== "") root.applyPlayerStatus(output, code !== 0)
       })
     }
   }
@@ -808,25 +880,14 @@ Panel {
 
         Text {
           width: parent.width
+          horizontalAlignment: Text.AlignHCenter
           textFormat: Text.PlainText
           text: strings.t("panel.title")
-          color: root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.title
-          font.bold: true
+          color: root.titleColorAt(0)
+          font.family: "Adwaita Sans"
+          font.pixelSize: Math.round(Style.font.display * 0.8)
+          font.weight: 600
           elide: Text.ElideRight
-        }
-
-        Text {
-          width: parent.width
-          textFormat: Text.PlainText
-          text: strings.t("panel.source")
-          wrapMode: Text.WordWrap
-          maximumLineCount: 3
-          elide: Text.ElideRight
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
         }
 
         Row {
@@ -845,20 +906,28 @@ Panel {
               anchors.top: parent.top
               anchors.left: parent.left
               anchors.right: parent.right
-              // The card shares the top and bottom of the name and region filters.
-              height: nameFilter.implicitHeight + stationColumn.spacing + regionFilter.implicitHeight
+              height: playerFace.height + playerStack.spacing + volumeRow.height + playerCard.contentTopInset + playerCard.contentBottomInset
               radius: Style.cornerRadius
               color: "transparent"
               borderSpec: Border.controlSpec("normal", root.foreground, Commons.Color.accent)
               padding: Style.space(8)
 
-              Item {
-                id: playerFace
-                anchors.fill: parent
+              Column {
+                id: playerStack
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
                 anchors.leftMargin: playerCard.contentLeftInset
                 anchors.rightMargin: playerCard.contentRightInset
                 anchors.topMargin: playerCard.contentTopInset
-                anchors.bottomMargin: playerCard.contentBottomInset
+                spacing: Style.space(8)
+
+                Item {
+                  id: playerFace
+                  width: parent.width
+                  // The station row stays as tall as the name and region filters.
+                  implicitHeight: nameFilter.implicitHeight + stationColumn.spacing + regionFilter.implicitHeight
+                  height: implicitHeight
 
                 Item {
                   id: playerIcon
@@ -986,6 +1055,68 @@ Panel {
                     visible: playMouse.containsMouse
                     text: (!root.playerActive || root.paused) ? strings.t("panel.play") : strings.t("panel.pause")
                     fontFamily: root.fontFamily
+                  }
+                }
+                }
+
+                Item {
+                  id: volumeRow
+                  width: parent.width
+                  height: Math.max(Style.space(28), volumeSlider.implicitHeight)
+
+                  Text {
+                    id: volumeGlyph
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(22)
+                    horizontalAlignment: Text.AlignHCenter
+                    textFormat: Text.PlainText
+                    text: "󰕾"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.heading
+
+                    HoverHandler { id: volumeHover }
+
+                    PanelToolTip {
+                      visible: volumeHover.hovered || volumeSlider.dragging
+                      text: strings.t("panel.volume")
+                      fontFamily: root.fontFamily
+                    }
+                  }
+
+                  Text {
+                    id: volumePercent
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: Style.space(44)
+                    horizontalAlignment: Text.AlignRight
+                    textFormat: Text.PlainText
+                    text: Math.round(volumeSlider.dragging ? volumeSlider.liveValue : root.volume) + "%"
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                  }
+
+                  PanelSlider {
+                    id: volumeSlider
+                    bar: root.bar
+                    anchors.left: volumeGlyph.right
+                    anchors.right: volumePercent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    anchors.leftMargin: Style.space(8)
+                    anchors.rightMargin: Style.space(8)
+                    minimum: 0
+                    maximum: 100
+                    step: 5
+                    integer: true
+                    value: root.volume
+                    onMoved: function(v) { root.previewVolume(v) }
+                    onReleased: function(v) {
+                      root.previewVolume(v)
+                      root.commitVolume()
+                    }
+                    onDraggingChanged: root.volumeDragging = dragging
                   }
                 }
               }
@@ -1221,12 +1352,6 @@ Panel {
               anchors.fill: parent
               hoverEnabled: true
               cursorShape: Qt.PointingHandCursor
-              // Scrolling moves rows under a still pointer. That is not a
-              // mouse move, so it must not steal the keyboard highlight.
-              onPositionChanged: function(mouse) {
-                if (root.wheelScrolling) return
-                if (pointerGate.moved(row, mouse)) root.selectedIndex = row.index
-              }
               onClicked: root.toggleStation(row.modelData)
             }
 

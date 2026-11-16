@@ -282,7 +282,7 @@ function fetchCommand(hostIndex) {
     "curl", "-fsS",
     "--max-time", "20",
     "--max-filesize", String(BODY_LIMIT),
-    "-A", "mattia.radio/1.0",
+    "-A", "impero365.radio-italia/1.0",
     "-H", "Accept: application/json",
     url
   ]
@@ -301,6 +301,9 @@ function parsePlayerStatus(raw) {
     if (data.name && !name) continue
     var reason = data.reason == null || data.reason === "" ? "" : String(data.reason)
     if (reason !== "" && reason !== "no-player" && reason !== "playback") continue
+    var volume = null
+    if (typeof data.volume === "number" && data.volume >= 0 && data.volume <= 100)
+      volume = Math.round(data.volume)
     return {
       running: data.running === true,
       paused: data.paused === true,
@@ -309,7 +312,8 @@ function parsePlayerStatus(raw) {
       error: data.error === true,
       id: id,
       name: name,
-      reason: reason
+      reason: reason,
+      volume: volume
     }
   }
   return null

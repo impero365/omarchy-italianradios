@@ -12,6 +12,7 @@ import "Model.js" as Model
 // than a day. The left column is the player and favorites. The right column
 // is the filters and the station list. A click asks radio-player to play the
 // stream in one sandboxed mpv. The player pauses and resumes that stream.
+// Logos are local files from radio-icon, after the public-address check.
 Panel {
   id: root
   moduleName: "impero365.radio-italia"
@@ -62,6 +63,15 @@ Panel {
     if (path.charAt(0) !== "/" || path.indexOf("..") !== -1 || /[\u0000-\u001F]/.test(path)) return ""
     return path
   }
+  readonly property string iconTool: {
+    var text = Qt.resolvedUrl("radio-icon").toString()
+    if (text.indexOf("file://") !== 0) return ""
+    var path = decodeURIComponent(text.slice(7))
+    if (path.charAt(0) !== "/" || path.indexOf("..") !== -1 || /[\u0000-\u001F]/.test(path)) return ""
+    return path
+  }
+  readonly property string iconMapPath: cacheDir !== "" ? cacheDir + "/icons.json" : ""
+  property var iconFiles: ({})
   // radio-player rewrites this on every command. A reloaded bar icon has no
   // memory of the station, so it reads the file instead of waiting for a click.
   readonly property string playbackPath: {
@@ -149,6 +159,22 @@ Panel {
   // Same directory row the lists use, so the player can show its icon and region.
   readonly property var playingStation: Model.findStation(stations, favorites, playingId)
   readonly property string playingIcon: playingStation && playingStation.icon ? playingStation.icon : ""
+  // radio-icon saves a logo only after the public-address check. The image
+  // widgets load that file, never the directory URL.
+  function localIcon(remote) {
+    var name = remote && iconFiles ? iconFiles[remote] : ""
+    return Model.iconFileUrl(cacheDir, name || "")
+  }
+  function queueIcons() {
+    if (!opened || !iconTool || cacheDir === "") return
+    if (iconProc.running) {
+      iconProc.again = true
+      return
+    }
+    iconProc.again = false
+    iconProc.command = [iconTool, cacheDir, favoritesPath]
+    iconProc.running = true
+  }
   readonly property string playingRegion: playingStation && playingStation.region ? playingStation.region : ""
   property bool paused: false
   property bool playerActive: false
@@ -556,6 +582,7 @@ Panel {
     refreshIfStale()
     refreshStatus()
     Qt.callLater(focusFilter)
+    queueIcons()
   }
 
   FileView {
@@ -606,6 +633,7 @@ Panel {
       if (code !== 0 || root.pendingFavorites === "" || root.favoritesPath === "") return
       favoritesFile.setText(root.pendingFavorites)
       root.pendingFavorites = ""
+      Qt.callLater(root.queueIcons)
     }
   }
 
@@ -616,6 +644,7 @@ Panel {
       if (code !== 0 || root.pendingCache === "" || root.cachePath === "") return
       cacheFile.setText(root.pendingCache)
       root.pendingCache = ""
+      Qt.callLater(root.queueIcons)
     }
   }
 
@@ -636,6 +665,33 @@ Panel {
         root.acceptFetch("")
       })
     }
+  }
+
+  FileView {
+    id: iconMapFile
+    path: root.iconMapPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: root.iconFiles = Model.parseIconMap(text())
+    onFileChanged: reload()
+  }
+
+  Process {
+    id: iconProc
+    property bool again: false
+    onExited: function() {
+      iconMapFile.reload()
+      if (!iconProc.again) return
+      iconProc.again = false
+      Qt.callLater(root.queueIcons)
+    }
+  }
+
+  Timer {
+    interval: 300
+    repeat: true
+    running: iconProc.running && root.iconMapPath !== ""
+    onTriggered: iconMapFile.reload()
   }
 
   Timer {
@@ -995,11 +1051,11 @@ Panel {
                   Loader {
                     id: playerLogo
                     anchors.fill: parent
-                    active: root.playingIcon !== ""
+                    active: root.localIcon(root.playingIcon) !== ""
                     sourceComponent: SizedImage {
                       anchors.fill: parent
                       asynchronous: true
-                      url: root.playingIcon
+                      url: root.localIcon(root.playingIcon)
                     }
                     readonly property bool shown: item && item.status === Image.Ready
                   }
@@ -1263,11 +1319,11 @@ Panel {
                 Loader {
                   id: savedLogo
                   anchors.fill: parent
-                  active: savedRow.modelData.icon !== ""
+                  active: root.localIcon(savedRow.modelData.icon) !== ""
                   sourceComponent: SizedImage {
                     anchors.fill: parent
                     asynchronous: true
-                    url: savedRow.modelData.icon
+                    url: root.localIcon(savedRow.modelData.icon)
                   }
                   readonly property bool shown: item && item.status === Image.Ready
                 }
@@ -1471,11 +1527,11 @@ Panel {
                 Loader {
                   id: logo
                   anchors.fill: parent
-                  active: row.modelData.icon !== ""
+                  active: root.localIcon(row.modelData.icon) !== ""
                   sourceComponent: SizedImage {
                     anchors.fill: parent
                     asynchronous: true
-                    url: row.modelData.icon
+                    url: root.localIcon(row.modelData.icon)
                   }
                   readonly property bool shown: item && item.status === Image.Ready
                 }

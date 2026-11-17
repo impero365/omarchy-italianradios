@@ -1,7 +1,8 @@
 // Pure helpers for the Italian radio panel. Directory text is untrusted:
 // names that contain markup are dropped, and only http(s) stream URLs and
-// https image icons are kept. Directory fetches are an argv array, never a
-// shell line. Playback goes through radio-player, which keeps one sandboxed mpv.
+// http(s) image icons are kept. The panel does not load an icon URL itself.
+// Directory fetches are an argv array, never a shell line. Playback goes
+// through radio-player, which keeps one sandboxed mpv.
 
 var BODY_LIMIT = 4000000
 var STATION_CAP = 2500
@@ -72,7 +73,7 @@ function streamUrl(value) {
 }
 
 function iconUrl(value) {
-  var s = httpUrl(value, true)
+  var s = httpUrl(value, false)
   if (!s) return ""
   var path = s.split("?")[0].split("#")[0].toLowerCase()
   if (!/\.(png|jpe?g|webp|gif|ico|svg)$/.test(path)) return ""
@@ -380,6 +381,43 @@ function tooltipText(playingName, idleLabel, playingLabel) {
   return String(playingLabel || "").replace("%1", name)
 }
 
+var ICON_FILE = /^[a-f0-9]{64}\.(png|jpe?g|gif|webp|ico)$/
+
+// A logo widget may load only a file radio-icon wrote under the cache.
+function iconFileUrl(cacheDir, name) {
+  var dir = String(cacheDir == null ? "" : cacheDir)
+  var file = String(name == null ? "" : name)
+  if (dir.charAt(0) !== "/" || dir.indexOf("..") !== -1 || /[\u0000-\u001F]/.test(dir)) return ""
+  if (!ICON_FILE.test(file)) return ""
+  var path = dir.replace(/\/+$/, "") + "/icons/" + file
+  return "file://" + encodeURI(path).replace(/#/g, "%23").replace(/\?/g, "%3F")
+}
+
+function parseIconMap(raw) {
+  var text = String(raw || "")
+  if (!text || text.length > BODY_LIMIT) return {}
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return {}
+  }
+  var icons = data && data.icons
+  if (!icons || typeof icons !== "object" || Array.isArray(icons)) return {}
+  var out = {}
+  var count = 0
+  for (var url in icons) {
+    if (!Object.prototype.hasOwnProperty.call(icons, url)) continue
+    if (count >= STATION_CAP) break
+    if (iconUrl(url) !== url) continue
+    var name = icons[url]
+    if (typeof name !== "string" || !ICON_FILE.test(name)) continue
+    out[url] = name
+    count++
+  }
+  return out
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     BODY_LIMIT: BODY_LIMIT,
@@ -405,6 +443,8 @@ if (typeof module !== "undefined") {
     findStation: findStation,
     nextInCircle: nextInCircle,
     longestField: longestField,
-    tooltipText: tooltipText
+    tooltipText: tooltipText,
+    iconFileUrl: iconFileUrl,
+    parseIconMap: parseIconMap
   }
 }

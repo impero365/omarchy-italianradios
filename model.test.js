@@ -61,7 +61,7 @@ test("directory rows keep an italian stream, a region, and an https icon", funct
   assert.equal(parsed[0].icon, "https://www.capital.it/favicon.ico")
   assert.equal(Model.parseDirectory("").length, 0)
   assert.equal(Model.parseDirectory("x".repeat(Model.BODY_LIMIT + 1)).length, 0)
-  assert.equal(Model.iconUrl("http://cdn.example.test/logo.png"), "")
+  assert.equal(Model.iconUrl("http://cdn.example.test/logo.png"), "http://cdn.example.test/logo.png")
   assert.equal(Model.streamUrl("https://user:pass@example.test/a"), "")
 })
 
@@ -289,4 +289,31 @@ test("a saved list is checked again and expires after a day", function() {
   assert.equal(Model.cacheIsStale(cached.fetchedAt, cached.fetchedAt + Model.CACHE_MAX_AGE_MS + 1), true)
   assert.equal(Model.cacheIsStale(cached.fetchedAt, cached.fetchedAt + 1000), false)
   assert.equal(Model.cacheIsStale(0, 1000), true)
+})
+
+test("a logo widget can load only a cached image file", function() {
+  var hash = "ab".repeat(32)
+  var remote = "https://cdn.example.test/logo.png"
+  assert.equal(
+    Model.iconFileUrl("/home/a b/.cache/impero365.radio-italia", hash + ".png"),
+    "file:///home/a%20b/.cache/impero365.radio-italia/icons/" + hash + ".png"
+  )
+  assert.equal(Model.iconFileUrl("/tmp/cache", hash + ".png"), "file:///tmp/cache/icons/" + hash + ".png")
+  assert.equal(Model.iconFileUrl("/tmp/cache", remote), "")
+  assert.equal(Model.iconFileUrl("/tmp/../cache", hash + ".png"), "")
+  assert.equal(Model.iconFileUrl("relative", hash + ".png"), "")
+  assert.equal(Model.iconFileUrl("/tmp/cache", "../" + hash + ".png"), "")
+
+  var mapped = Model.parseIconMap(JSON.stringify({
+    icons: {
+      "https://cdn.example.test/logo.png": hash + ".webp",
+      "https://127.0.0.1/logo.png": hash + ".png",
+      "https://user:pass@cdn.example.test/logo.png": hash + ".png",
+      "https://cdn.example.test/ok.ico": "../secret.png"
+    }
+  }))
+  assert.deepEqual(mapped, {
+    "https://cdn.example.test/logo.png": hash + ".webp",
+    "https://127.0.0.1/logo.png": hash + ".png"
+  })
 })

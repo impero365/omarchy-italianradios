@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Save station logos after the stream proxy's public-address check.
+
+The panel never loads a directory icon URL itself. Each HTTP or HTTPS image is
+resolved and refused when any answer is private, local, or locally routed.
+The connection uses the address that passed that check. A redirect is fetched
+only when its target passes the same check. The cached file is a PNG, JPEG,
+WebP, GIF, or ICO.
+"""
+
+import hashlib
+import http.client
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import ssl
+import sys
+import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.parse import urljoin, urlsplit
+
+MAX_BODY = 1_048_576
+MAX_URLS = 2500
+MAX_REDIRECTS = 4
+FETCH_WORKERS = 8
+FETCH_TIMEOUT = 4
+BLOCK_TTL = 24 * 60 * 60
+READ_LIMIT = 4_000_000
+ICON_NAME = re.compile(r"^[a-f0-9]{64}\.(png|jpe?g|gif|webp|ico)$")
+REDIRECTS = {301, 302, 303, 307, 308}
+
+
+def load_proxy():
+    path = Path(__file__).resolve().with_name("radio-proxy")
+    loader = importlib.machinery.SourceFileLoader("radio_proxy_icon", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+proxy = load_proxy()
+
+
+class IconDenied(Exception):
+    """This URL is not a public image we can store."""
+
+
+class FetchFailed(Exception):
+    """The image could not be fetched. A later run may try again."""
+
+
+def parse_icon_url(url):
+    if not isinstance(url, str) or not 12 <= len(url) <= 500:
+        raise IconDenied()
+    if any(ord(ch) < 32 or ord(ch) == 127 or ch in ' <>"\'\\' for ch in url):
+        raise IconDenied()
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as error:
+        raise IconDenied() from error
+    scheme = parts.scheme.lower()
+    if scheme not in ("http", "https") or not parts.hostname:
+        raise IconDenied()
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    if parts.username is not None or parts.password is not None or parts.fragment:
+        raise IconDenied()
+    if not 1 <= port <= 65_535:
+        raise IconDenied()
+    bare = (parts.path or "").lower()
+    if not bare.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".ico")):
+        raise IconDenied()
+    return parts
+
+
+def sniff(body):
+    if len(body) < 8 or len(body) > MAX_BODY:
+        return ""
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if body.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if body.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "webp"
+    if body[:4] == b"\x00\x00\x01\x00":
+        return "ico"
+    return ""
+
+
+def open_public(host, port):
+    """Connect to the address that just passed the public-address check."""
+    raw = proxy.connect_public(host, port, timeout=FETCH_TIMEOUT)
+    raw.settimeout(FETCH_TIMEOUT)
+    return raw
+
+
+def open_public_tls(host, port):
+    """Connect to the checked address, then verify the certificate for host."""
+    raw = open_public(host, port)
+    try:
+        return ssl.create_default_context().wrap_socket(raw, server_hostname=host)
+    except Exception:
+        raw.close()
+        raise
+
+
+def exchange(url):
+    parts = parse_icon_url(url)
+    scheme = parts.scheme.lower()
+    host = parts.hostname
+    port = parts.port or (443 if scheme == "https" else 80)
+    path = parts.path or "/"
+    if parts.query:
+        path += "?" + parts.query
+    connection = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
+    conn = connection(host, port, timeout=FETCH_TIMEOUT)
+
+    def connect_checked():
+        conn.sock = open_public_tls(host, port) if scheme == "https" else open_public(host, port)
+
+    conn.connect = connect_checked
+    try:
+        try:
+            conn.request(
+                "GET",
+                path,
+                headers={
+                    "User-Agent": "impero365.radio-italia/1.0",
+                    "Accept": "image/png, image/jpeg, image/webp, image/gif, image/x-icon",
+                    "Connection": "close",
+                },
+            )
+            response = conn.getresponse()
+        except proxy.ProxyError:
+            raise
+        except (OSError, http.client.HTTPException, ssl.SSLError, TimeoutError, UnicodeEncodeError) as error:
+            raise FetchFailed() from error
+        length = response.getheader("Content-Length")
+        if length is not None:
+            try:
+                announced = int(length)
+            except ValueError as error:
+                raise IconDenied() from error
+            if announced > MAX_BODY:
+                raise IconDenied()
+        try:
+            body = response.read(MAX_BODY + 1)
+        except (OSError, http.client.HTTPException, ssl.SSLError, TimeoutError) as error:
+            raise FetchFailed() from error
+        if len(body) > MAX_BODY:
+            raise IconDenied()
+        headers = {name.lower(): value for name, value in response.getheaders()}
+        return response.status, headers, body
+    finally:
+        conn.close()
+
+
+def resolve_redirect(current, location):
+    if not isinstance(location, str) or any(ord(ch) < 32 or ord(ch) == 127 for ch in location):
+        raise IconDenied()
+    target = urljoin(current, location.strip())
+    parse_icon_url(target)
+    return target
+
+
+def fetch_bytes(url, send=None):
+    if send is None:
+        send = exchange
+    current = url
+    for _ in range(MAX_REDIRECTS + 1):
+        parse_icon_url(current)
+        try:
+            status, headers, body = send(current)
+        except proxy.ProxyError as error:
+            if error.status.startswith(b"403"):
+                raise IconDenied() from error
+            raise FetchFailed() from error
+        except IconDenied:
+            raise
+        except FetchFailed:
+            raise
+        except (OSError, http.client.HTTPException, ssl.SSLError, TimeoutError) as error:
+            raise FetchFailed() from error
+        if status in REDIRECTS:
+            found = ""
+            for name, value in headers.items():
+                if str(name).lower() == "location":
+                    found = value
+            current = resolve_redirect(current, found)
+            continue
+        if status != 200:
+            raise IconDenied()
+        kind = sniff(body)
+        if not kind:
+            raise IconDenied()
+        return kind, body
+    raise IconDenied()
+
+
+def safe_path(path):
+    if not isinstance(path, str) or not path or "\0" in path or not os.path.isabs(path):
+        raise SystemExit(2)
+    if any(part == ".." for part in path.split("/")):
+        raise SystemExit(2)
+    return os.path.normpath(path)
+
+
+def icon_urls(path):
+    if not path or not os.path.isfile(path):
+        return []
+    try:
+        if os.path.getsize(path) > READ_LIMIT:
+            return []
+        with open(path, "rb") as handle:
+            data = json.loads(handle.read())
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return []
+    rows = data.get("stations") if isinstance(data, dict) else data if isinstance(data, list) else None
+    if not isinstance(rows, list):
+        return []
+    found = []
+    for row in rows:
+        if isinstance(row, dict) and isinstance(row.get("icon"), str):
+            found.append(row["icon"])
+    return found
+
+
+def load_state(path):
+    state = {"icons": {}, "blocked": {}}
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(READ_LIMIT + 1)
+        if len(raw) > READ_LIMIT:
+            return state
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return state
+    if not isinstance(data, dict):
+        return state
+    now = time.time()
+    icons = data.get("icons")
+    blocked = data.get("blocked")
+    if isinstance(icons, dict):
+        for url, name in icons.items():
+            if isinstance(url, str) and isinstance(name, str) and ICON_NAME.fullmatch(name):
+                state["icons"][url] = name
+    if isinstance(blocked, dict):
+        for url, when in blocked.items():
+            if isinstance(url, str) and isinstance(when, (int, float)) and 0 <= now - when < BLOCK_TTL:
+                state["blocked"][url] = when
+    return state
+
+
+def atomic_write(path, payload):
+    directory = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".icon-")
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, payload)
+        os.fsync(fd)
+    except Exception:
+        os.close(fd)
+        os.unlink(tmp)
+        raise
+    os.close(fd)
+    os.replace(tmp, path)
+
+
+def write_state(path, state):
+    payload = json.dumps(
+        {"blocked": state["blocked"], "icons": state["icons"]},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode() + b"\n"
+    atomic_write(path, payload)
+
+
+def remember(state, state_path, url, filename):
+    if filename:
+        state["icons"][url] = filename
+        state["blocked"].pop(url, None)
+    else:
+        state["blocked"][url] = time.time()
+        state["icons"].pop(url, None)
+    write_state(state_path, state)
+
+
+def fetch_one(url, icons_dir, fetch):
+    try:
+        _kind, body = fetch(url)
+        ext = sniff(body)
+        if not ext:
+            raise IconDenied()
+    except IconDenied:
+        return url, ""
+    except FetchFailed:
+        return url, None
+    filename = hashlib.sha256(url.encode("utf-8")).hexdigest() + "." + ext
+    atomic_write(os.path.join(icons_dir, filename), body)
+    return url, filename
+
+
+def sync(cache, urls, fetch=fetch_bytes):
+    cache = safe_path(cache)
+    os.makedirs(cache, mode=0o700, exist_ok=True)
+    icons_dir = os.path.join(cache, "icons")
+    os.makedirs(icons_dir, mode=0o700, exist_ok=True)
+    os.chmod(icons_dir, 0o700)
+    state_path = os.path.join(cache, "icons.json")
+    state = load_state(state_path)
+    pending = []
+    seen = set()
+    for url in urls:
+        if url in seen or len(seen) >= MAX_URLS:
+            continue
+        seen.add(url)
+        try:
+            parse_icon_url(url)
+        except IconDenied:
+            continue
+        name = state["icons"].get(url)
+        if name and os.path.isfile(os.path.join(icons_dir, name)):
+            continue
+        blocked_at = state["blocked"].get(url)
+        if blocked_at is not None and time.time() - float(blocked_at) < BLOCK_TTL:
+            continue
+        pending.append(url)
+    if not pending:
+        return state
+    workers = min(FETCH_WORKERS, len(pending))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fetch_one, url, icons_dir, fetch) for url in pending]
+        for done in as_completed(futures):
+            url, filename = done.result()
+            if filename is None:
+                continue
+            remember(state, state_path, url, filename)
+    return state
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv
+    if len(argv) not in (2, 3):
+        raise SystemExit(2)
+    cache = safe_path(argv[1])
+    favorites = safe_path(argv[2]) if len(argv) == 3 and argv[2] else ""
+    os.umask(0o077)
+    urls = icon_urls(os.path.join(cache, "stations.json"))
+    if favorites:
+        urls.extend(icon_urls(favorites))
+    sync(cache, urls)
+
+
+if __name__ == "__main__":
+    main()

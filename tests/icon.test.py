@@ -297,6 +297,70 @@ class Cache(unittest.TestCase):
         finally:
             icon.CACHE_MAX_BYTES = original
 
+    def test_a_linked_cache_is_left_alone(self):
+        decoy = make_cache()
+        marker = decoy / "keep.txt"
+        marker.write_text("keep")
+        link_parent = make_cache()
+        link = link_parent / "cache"
+        link.symlink_to(decoy)
+        try:
+            with self.assertRaises(OSError):
+                icon.sync(str(link), [LOGO], fetch=lambda url: ("png", PNG))
+            self.assertEqual(marker.read_text(), "keep")
+            self.assertEqual([path.name for path in decoy.iterdir()], ["keep.txt"])
+            self.assertTrue(link.is_symlink())
+        finally:
+            link.unlink()
+            remove_cache(decoy)
+            remove_cache(link_parent)
+
+    def test_a_linked_icon_directory_is_left_alone(self):
+        decoy = make_cache()
+        marker = decoy / "keep.txt"
+        marker.write_text("keep")
+        icons = self.root / "icons"
+        icons.symlink_to(decoy)
+        try:
+            with self.assertRaises(OSError):
+                icon.sync(str(self.root), [LOGO], fetch=lambda url: ("png", PNG))
+            self.assertEqual(marker.read_text(), "keep")
+            self.assertEqual([path.name for path in decoy.iterdir()], ["keep.txt"])
+            self.assertFalse((self.root / "icons.json").exists())
+            self.assertTrue(icons.is_symlink())
+        finally:
+            icons.unlink()
+            remove_cache(decoy)
+
+    def test_entries_the_plugin_did_not_create_stay(self):
+        root = self.root
+
+        def fetch(url):
+            return "png", PNG
+
+        icon.sync(str(root), [LOGO], fetch=fetch)
+        icons = root / "icons"
+        note = icons / "notes.txt"
+        note.write_text("leave me")
+        nested = icons / "other"
+        nested.mkdir()
+        (nested / "inside.txt").write_text("inside")
+        alias = icons / "alias"
+        alias.symlink_to(note)
+        linked_logo = icons / ("cd" * 32 + ".png")
+        linked_logo.symlink_to(note)
+        old_logo = icons / ("ab" * 32 + ".png")
+        old_logo.write_bytes(PNG)
+        icon.sync(str(root), [LOGO], fetch=fetch)
+        self.assertEqual(note.read_text(), "leave me")
+        self.assertEqual((nested / "inside.txt").read_text(), "inside")
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue(linked_logo.is_symlink())
+        self.assertEqual(linked_logo.read_text(), "leave me")
+        self.assertFalse(old_logo.exists())
+        saved = load_saved(root)["icons"][LOGO]
+        self.assertTrue((icons / saved).is_file())
+
     def test_cleanup_does_not_follow_a_replaced_directory(self):
         decoy = make_cache()
         marker = decoy / "keep.txt"

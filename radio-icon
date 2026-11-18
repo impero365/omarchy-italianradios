@@ -6,9 +6,12 @@ resolved and refused when any answer is private, local, or locally routed.
 The connection uses the address that passed that check. A redirect is fetched
 only when its target passes the same check. The cached file is a PNG, JPEG,
 WebP, GIF, or ICO. Logos the current directory no longer uses are removed,
-and the icon directory stays within CACHE_MAX_BYTES.
+and the icon directory stays within CACHE_MAX_BYTES. The cache and icon
+directories must be real directories. Cleanup removes only regular files
+whose names match a logo this plugin stores.
 """
 
+import errno
 import hashlib
 import http.client
 import importlib.machinery
@@ -19,7 +22,6 @@ import re
 import ssl
 import stat
 import sys
-import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -240,11 +242,10 @@ def icon_urls(path):
     return found
 
 
-def load_state(path):
+def load_state_at(dir_fd):
     state = {"icons": {}, "blocked": {}}
     try:
-        with open(path, "rb") as handle:
-            raw = handle.read(READ_LIMIT + 1)
+        raw = read_at(dir_fd, "icons.json", READ_LIMIT)
         if len(raw) > READ_LIMIT:
             return state
         data = json.loads(raw)
@@ -266,38 +267,86 @@ def load_state(path):
     return state
 
 
-def atomic_write(path, payload):
-    directory = os.path.dirname(path)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".icon-")
+def open_real_directory(path, parent_fd=None):
+    """Open a real directory. An existing symlink is refused and left in place."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    kwargs = {"dir_fd": parent_fd} if parent_fd is not None else {}
     try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, payload)
+        fd = os.open(path, flags, **kwargs)
+    except FileNotFoundError:
+        os.mkdir(path, 0o700, **kwargs)
+        fd = os.open(path, flags, **kwargs)
+    try:
+        os.fchmod(fd, 0o700)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def read_at(dir_fd, name, limit):
+    """Read a regular file in dir_fd. A symlink is not followed."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise OSError(errno.ELOOP, "cache entry is not a regular file")
+        chunks = []
+        remaining = limit + 1
+        while remaining > 0:
+            block = os.read(fd, min(remaining, 65536))
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def atomic_write_at(dir_fd, name, payload):
+    """Replace a regular file in dir_fd. A symlink or other entry is left in place."""
+    try:
+        info = os.lstat(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        info = None
+    if info is not None and not stat.S_ISREG(info.st_mode):
+        raise OSError(errno.ELOOP, "refusing to replace a cache entry that is not a regular file")
+    tmp = ".icon-%s" % os.urandom(8).hex()
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(fd, view)
+            if written <= 0:
+                raise OSError(errno.EIO, "cache write made no progress")
+            view = view[written:]
         os.fsync(fd)
     except Exception:
         os.close(fd)
-        os.unlink(tmp)
+        os.unlink(tmp, dir_fd=dir_fd)
         raise
     os.close(fd)
-    os.replace(tmp, path)
+    os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
 
 
-def write_state(path, state):
+def write_state_at(dir_fd, state):
     payload = json.dumps(
         {"blocked": state["blocked"], "icons": state["icons"]},
         separators=(",", ":"),
         sort_keys=True,
     ).encode() + b"\n"
-    atomic_write(path, payload)
+    atomic_write_at(dir_fd, "icons.json", payload)
 
 
-def remember(state, state_path, url, filename):
+def remember(state, cache_fd, url, filename):
     if filename:
         state["icons"][url] = filename
         state["blocked"].pop(url, None)
     else:
         state["blocked"][url] = time.time()
         state["icons"].pop(url, None)
-    write_state(state_path, state)
+    write_state_at(cache_fd, state)
 
 
 class ByteBudget:
@@ -319,7 +368,18 @@ class ByteBudget:
             self.remaining += size
 
 
-def trim_cache(state, icons_dir, wanted):
+def unlink_logo(icons_fd, name):
+    """Remove one regular logo file. Another kind of directory entry is left in place."""
+    if not ICON_NAME.fullmatch(name):
+        return False
+    info = os.lstat(name, dir_fd=icons_fd)
+    if not stat.S_ISREG(info.st_mode):
+        return False
+    os.unlink(name, dir_fd=icons_fd)
+    return True
+
+
+def trim_cache(state, icons_fd, wanted):
     """Drop logos the current directory no longer uses, then the oldest files past the cap."""
     changed = False
     for url in list(state["icons"]):
@@ -337,30 +397,31 @@ def trim_cache(state, icons_dir, wanted):
 
     kept = []
     total = 0
-    with os.scandir(icons_dir) as scan:
-        for entry in scan:
+    for name in os.listdir(icons_fd):
+        if not ICON_NAME.fullmatch(name):
+            continue
+        try:
+            info = os.lstat(name, dir_fd=icons_fd)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        if name not in keep:
             try:
-                info = entry.stat(follow_symlinks=False)
+                if unlink_logo(icons_fd, name):
+                    changed = True
             except OSError:
                 continue
-            referenced = stat.S_ISREG(info.st_mode) and entry.name in keep
-            if not referenced:
-                if stat.S_ISDIR(info.st_mode):
-                    continue
-                try:
-                    os.unlink(entry.path)
-                except OSError:
-                    continue
-                changed = True
-                continue
-            kept.append((info.st_mtime, entry.name, info.st_size))
-            total += info.st_size
+            continue
+        kept.append((info.st_mtime, name, info.st_size))
+        total += info.st_size
 
     kept.sort()
     while total > CACHE_MAX_BYTES and kept:
         _mtime, name, size = kept.pop(0)
         try:
-            os.unlink(os.path.join(icons_dir, name))
+            if not unlink_logo(icons_fd, name):
+                continue
         except OSError:
             continue
         for url in keep.get(name, ()):
@@ -370,7 +431,7 @@ def trim_cache(state, icons_dir, wanted):
     return changed, max(0, total)
 
 
-def fetch_one(url, icons_dir, fetch, budget):
+def fetch_one(url, icons_fd, fetch, budget):
     try:
         _kind, body = fetch(url)
         ext = sniff(body)
@@ -384,21 +445,38 @@ def fetch_one(url, icons_dir, fetch, budget):
         return url, SKIPPED
     filename = hashlib.sha256(url.encode("utf-8")).hexdigest() + "." + ext
     try:
-        atomic_write(os.path.join(icons_dir, filename), body)
+        atomic_write_at(icons_fd, filename, body)
     except Exception:
         budget.release(len(body))
         raise
     return url, filename
 
 
+def regular_logo(icons_fd, name):
+    if not name or not ICON_NAME.fullmatch(name):
+        return False
+    try:
+        info = os.lstat(name, dir_fd=icons_fd)
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode)
+
+
 def sync(cache, urls, fetch=fetch_bytes):
     cache = safe_path(cache)
-    os.makedirs(cache, mode=0o700, exist_ok=True)
-    icons_dir = os.path.join(cache, "icons")
-    os.makedirs(icons_dir, mode=0o700, exist_ok=True)
-    os.chmod(icons_dir, 0o700)
-    state_path = os.path.join(cache, "icons.json")
-    state = load_state(state_path)
+    cache_fd = open_real_directory(cache)
+    try:
+        icons_fd = open_real_directory("icons", cache_fd)
+        try:
+            return sync_open(cache_fd, icons_fd, urls, fetch)
+        finally:
+            os.close(icons_fd)
+    finally:
+        os.close(cache_fd)
+
+
+def sync_open(cache_fd, icons_fd, urls, fetch):
+    state = load_state_at(cache_fd)
     wanted = []
     seen = set()
     for url in urls:
@@ -410,13 +488,13 @@ def sync(cache, urls, fetch=fetch_bytes):
         except IconDenied:
             continue
         wanted.append(url)
-    changed, used = trim_cache(state, icons_dir, set(wanted))
+    changed, used = trim_cache(state, icons_fd, set(wanted))
     if changed:
-        write_state(state_path, state)
+        write_state_at(cache_fd, state)
     pending = []
     for url in wanted:
         name = state["icons"].get(url)
-        if name and os.path.isfile(os.path.join(icons_dir, name)):
+        if regular_logo(icons_fd, name):
             continue
         blocked_at = state["blocked"].get(url)
         if blocked_at is not None and time.time() - float(blocked_at) < BLOCK_TTL:
@@ -427,12 +505,12 @@ def sync(cache, urls, fetch=fetch_bytes):
     budget = ByteBudget(CACHE_MAX_BYTES - used)
     workers = min(FETCH_WORKERS, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(fetch_one, url, icons_dir, fetch, budget) for url in pending]
+        futures = [pool.submit(fetch_one, url, icons_fd, fetch, budget) for url in pending]
         for done in as_completed(futures):
             url, filename = done.result()
             if filename is None or filename is SKIPPED:
                 continue
-            remember(state, state_path, url, filename)
+            remember(state, cache_fd, url, filename)
     return state
 
 

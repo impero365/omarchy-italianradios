@@ -382,6 +382,21 @@ function tooltipText(playingName, idleLabel, playingLabel) {
 }
 
 var ICON_FILE = /^[a-f0-9]{64}\.(png|jpe?g|gif|webp|ico)$/
+var PLUGIN_VERSION = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/
+
+// The panel shows only a plain release number from its own manifest.
+function pluginVersion(raw) {
+  var text = String(raw || "")
+  if (!text || text.length > 8192) return ""
+  var data
+  try {
+    data = JSON.parse(text)
+  } catch (e) {
+    return ""
+  }
+  if (!data || typeof data.version !== "string" || !PLUGIN_VERSION.test(data.version)) return ""
+  return data.version
+}
 
 // A logo widget may load only a file radio-icon wrote under the cache.
 function iconFileUrl(cacheDir, name) {
@@ -445,6 +460,7 @@ if (typeof module !== "undefined") {
     longestField: longestField,
     tooltipText: tooltipText,
     iconFileUrl: iconFileUrl,
-    parseIconMap: parseIconMap
+    parseIconMap: parseIconMap,
+    pluginVersion: pluginVersion
   }
 }

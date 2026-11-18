@@ -71,6 +71,14 @@ Panel {
     return path
   }
   readonly property string iconMapPath: cacheDir !== "" ? cacheDir + "/icons.json" : ""
+  readonly property string manifestPath: {
+    var text = Qt.resolvedUrl("manifest.json").toString()
+    if (text.indexOf("file://") !== 0) return ""
+    var path = decodeURIComponent(text.slice(7))
+    if (path.charAt(0) !== "/" || path.indexOf("..") !== -1 || /[\u0000-\u001F]/.test(path)) return ""
+    return path
+  }
+  property string pluginVersion: ""
   property var iconFiles: ({})
   // radio-player rewrites this on every command. A reloaded bar icon has no
   // memory of the station, so it reads the file instead of waiting for a click.
@@ -668,6 +676,15 @@ Panel {
   }
 
   FileView {
+    id: manifestFile
+    path: root.manifestPath
+    printErrors: false
+    watchChanges: true
+    onLoaded: root.pluginVersion = Model.pluginVersion(text())
+    onFileChanged: reload()
+  }
+
+  FileView {
     id: iconMapFile
     path: root.iconMapPath
     watchChanges: true
@@ -988,16 +1005,37 @@ Panel {
         anchors.fill: parent
         spacing: Style.space(8)
 
-        Text {
+        Item {
           width: parent.width
-          horizontalAlignment: Text.AlignHCenter
-          textFormat: Text.PlainText
-          text: strings.t("panel.title")
-          color: root.titleColorAt(0)
-          font.family: "Adwaita Sans"
-          font.pixelSize: Math.round(Style.font.display * 0.8)
-          font.weight: 600
-          elide: Text.ElideRight
+          implicitHeight: titleRow.implicitHeight
+          height: implicitHeight
+
+          Row {
+            id: titleRow
+            anchors.horizontalCenter: parent.horizontalCenter
+            spacing: Style.space(8)
+
+            Text {
+              id: titleText
+              textFormat: Text.PlainText
+              text: strings.t("panel.title")
+              color: root.titleColorAt(0)
+              font.family: "Adwaita Sans"
+              font.pixelSize: Math.round(Style.font.display * 0.8)
+              font.weight: 600
+            }
+
+            Text {
+              visible: root.pluginVersion !== ""
+              anchors.baseline: titleText.baseline
+              textFormat: Text.PlainText
+              text: root.pluginVersion
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.weight: 500
+            }
+          }
         }
 
         Row {

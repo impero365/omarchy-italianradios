@@ -23,6 +23,9 @@ test("markup-shaped names, regions, and icons never become display text or urls"
   assert.equal(Model.iconUrl('https://a.favicon.im/x?larger=true" alt="x" loading="lazy" />'), "")
   assert.equal(Model.tooltipText(MARKUP, "Italian radios", "Playing %1"), "Italian radios")
   assert.equal(Model.tooltipText("Radio Capital", "Italian radios", "Playing %1"), "Playing Radio Capital")
+  assert.equal(Model.pluginVersion(JSON.stringify({ version: "1.0.4" })), "1.0.4")
+  assert.equal(Model.pluginVersion(JSON.stringify({ version: MARKUP })), "")
+  assert.equal(Model.pluginVersion("{"), "")
 
   var parsed = Model.parseDirectory(JSON.stringify([
     station({ name: MARKUP, state: MARKUP, favicon: MARKUP }),

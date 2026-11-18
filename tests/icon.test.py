@@ -4,7 +4,10 @@
 import importlib.machinery
 import importlib.util
 import json
+import os
 import socket
+import stat
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -23,6 +26,69 @@ LOGO = "https://cdn.example/logo.png"
 def load_saved(cache):
     path = Path(cache) / "icons.json"
     return json.loads(path.read_text())
+
+
+def make_cache():
+    """A private directory this test created. The name is not predictable."""
+    root = Path(tempfile.mkdtemp(prefix="radio-icon-"))
+    info = root.lstat()
+    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+        raise RuntimeError("icon test cache is not a private directory")
+    return root
+
+
+def remove_cache(root):
+    """Remove root only when it is still the private directory this test created."""
+    root = Path(root)
+    try:
+        info = root.lstat()
+    except FileNotFoundError:
+        return
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    owned = (
+        stat.S_ISDIR(info.st_mode)
+        and not stat.S_ISLNK(info.st_mode)
+        and info.st_uid == os.getuid()
+        and root.name.startswith("radio-icon-")
+        and root.parent.resolve() == temp_root
+    )
+    if not owned:
+        return
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        current = os.fstat(fd)
+        if current.st_ino != info.st_ino or current.st_dev != info.st_dev:
+            return
+        for name in os.listdir(fd):
+            _remove_entry(fd, name)
+    finally:
+        os.close(fd)
+    try:
+        again = root.lstat()
+    except FileNotFoundError:
+        return
+    if again.st_ino != info.st_ino or again.st_dev != info.st_dev or stat.S_ISLNK(again.st_mode):
+        return
+    os.rmdir(root)
+
+
+def _remove_entry(dir_fd, name):
+    try:
+        info = os.lstat(name, dir_fd=dir_fd)
+    except OSError:
+        return
+    if stat.S_ISLNK(info.st_mode) or stat.S_ISREG(info.st_mode):
+        os.unlink(name, dir_fd=dir_fd)
+        return
+    if not stat.S_ISDIR(info.st_mode):
+        return
+    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        for entry in os.listdir(child):
+            _remove_entry(child, entry)
+    finally:
+        os.close(child)
+    os.rmdir(name, dir_fd=dir_fd)
 
 
 class AddressCheck(unittest.TestCase):
@@ -138,95 +204,117 @@ class AddressCheck(unittest.TestCase):
 
 
 class Cache(unittest.TestCase):
+    def setUp(self):
+        self.root = make_cache()
+
+    def tearDown(self):
+        remove_cache(self.root)
+
     def test_a_public_image_is_stored_under_its_hash(self):
-        cache = Path(self.id().replace(".", "-"))
-        root = Path("/tmp") / cache.name
+        root = self.root
         calls = []
 
         def fetch(url):
             calls.append(url)
             return "png", PNG
 
-        try:
-            state = icon.sync(str(root), [LOGO, LOGO], fetch=fetch)
-            icon.sync(str(root), [LOGO], fetch=fetch)
-            name = state["icons"][LOGO]
-            self.assertEqual(calls, [LOGO])
-            self.assertTrue(name.endswith(".png"))
-            self.assertEqual((root / "icons" / name).read_bytes(), PNG)
-            self.assertEqual(load_saved(root)["icons"][LOGO], name)
-        finally:
-            for path in (root / "icons").glob("*"):
-                path.unlink()
-            for path in (root / "icons.json",):
-                path.unlink(missing_ok=True)
-            (root / "icons").rmdir()
-            root.rmdir()
+        state = icon.sync(str(root), [LOGO, LOGO], fetch=fetch)
+        icon.sync(str(root), [LOGO], fetch=fetch)
+        name = state["icons"][LOGO]
+        self.assertEqual(calls, [LOGO])
+        self.assertTrue(name.endswith(".png"))
+        self.assertEqual((root / "icons" / name).read_bytes(), PNG)
+        self.assertEqual(load_saved(root)["icons"][LOGO], name)
 
     def test_a_non_image_is_blocked_and_not_stored(self):
-        cache = Path(self.id().replace(".", "-"))
-        root = Path("/tmp") / cache.name
+        root = self.root
 
         def fetch(url):
             return "png", b"<html>no</html>"
 
-        try:
-            state = icon.sync(str(root), [LOGO, "https://user:pass@cdn.example/logo.png"], fetch=fetch)
-            self.assertNotIn(LOGO, state["icons"])
-            self.assertIn(LOGO, state["blocked"])
-            self.assertEqual(list((root / "icons").iterdir()), [])
-            calls = []
+        state = icon.sync(str(root), [LOGO, "https://user:pass@cdn.example/logo.png"], fetch=fetch)
+        self.assertNotIn(LOGO, state["icons"])
+        self.assertIn(LOGO, state["blocked"])
+        self.assertEqual(list((root / "icons").iterdir()), [])
+        calls = []
 
-            def again(url):
-                calls.append(url)
-                return "png", PNG
+        def again(url):
+            calls.append(url)
+            return "png", PNG
 
-            icon.sync(str(root), [LOGO], fetch=again)
-            self.assertEqual(calls, [])
-        finally:
-            for path in (root / "icons").glob("*"):
-                path.unlink()
-            (root / "icons.json").unlink(missing_ok=True)
-            (root / "icons").rmdir()
-            root.rmdir()
+        icon.sync(str(root), [LOGO], fetch=again)
+        self.assertEqual(calls, [])
 
     def test_urls_come_from_the_saved_station_files(self):
-        cache = Path(self.id().replace(".", "-"))
-        root = Path("/tmp") / cache.name
-        root.mkdir()
+        root = self.root
         favorites = root / "favorites.json"
+        (root / "stations.json").write_text(json.dumps({
+            "stations": [
+                {"icon": LOGO},
+                {"icon": "https://127.0.0.1/logo.png"},
+                {"icon": "file:///tmp/secret.png"},
+            ]
+        }))
+        favorites.write_text(json.dumps({"stations": [{"icon": "https://cdn.example/other.jpg"}]}))
+        seen = []
+
+        def fetch(url):
+            seen.append(url)
+            if url.endswith(".jpg"):
+                return "jpg", b"\xff\xd8\xff" + b"\x00" * 8
+            raise icon.IconDenied()
+
+        icon.sync(str(root), icon.icon_urls(str(root / "stations.json")) + icon.icon_urls(str(favorites)), fetch=fetch)
+        self.assertEqual(set(seen), {LOGO, "https://127.0.0.1/logo.png", "https://cdn.example/other.jpg"})
+        saved = load_saved(root)
+        self.assertIn("https://cdn.example/other.jpg", saved["icons"])
+        self.assertIn("https://127.0.0.1/logo.png", saved["blocked"])
+        self.assertNotIn(LOGO, saved["icons"])
+
+    def test_logos_outside_the_current_directory_are_deleted_and_the_cap_holds(self):
+        root = self.root
+        old = "https://cdn.example/old.png"
+        urls = [f"https://cdn.example/{name}.png" for name in ("one", "two", "three")]
+        cap = len(PNG) * 2
+        original = icon.CACHE_MAX_BYTES
+        icon.CACHE_MAX_BYTES = cap
+
+        def fetch(url):
+            return "png", PNG
+
         try:
-            (root / "stations.json").write_text(json.dumps({
-                "stations": [
-                    {"icon": LOGO},
-                    {"icon": "https://127.0.0.1/logo.png"},
-                    {"icon": "file:///tmp/secret.png"},
-                ]
-            }))
-            favorites.write_text(json.dumps({"stations": [{"icon": "https://cdn.example/other.jpg"}]}))
-            seen = []
-
-            def fetch(url):
-                seen.append(url)
-                if url.endswith(".jpg"):
-                    return "jpg", b"\xff\xd8\xff" + b"\x00" * 8
-                raise icon.IconDenied()
-
-            icon.sync(str(root), icon.icon_urls(str(root / "stations.json")) + icon.icon_urls(str(favorites)), fetch=fetch)
-            self.assertEqual(set(seen), {LOGO, "https://127.0.0.1/logo.png", "https://cdn.example/other.jpg"})
-            saved = load_saved(root)
-            self.assertIn("https://cdn.example/other.jpg", saved["icons"])
-            self.assertIn("https://127.0.0.1/logo.png", saved["blocked"])
-            self.assertNotIn(LOGO, saved["icons"])
+            icon.sync(str(root), [old], fetch=fetch)
+            self.assertIn(old, load_saved(root)["icons"])
+            state = icon.sync(str(root), urls, fetch=fetch)
+            self.assertNotIn(old, state["icons"])
+            self.assertNotIn(old, state["blocked"])
+            self.assertEqual(len(state["icons"]), 2)
+            stored = list((root / "icons").iterdir())
+            self.assertEqual(len(stored), 2)
+            self.assertLessEqual(sum(path.stat().st_size for path in stored), cap)
+            names = {path.name for path in stored}
+            self.assertTrue(all(name in state["icons"].values() for name in names))
         finally:
-            for path in root.glob("*"):
-                if path.is_dir():
-                    for child in path.glob("*"):
-                        child.unlink()
-                    path.rmdir()
-                else:
-                    path.unlink()
-            root.rmdir()
+            icon.CACHE_MAX_BYTES = original
+
+    def test_cleanup_does_not_follow_a_replaced_directory(self):
+        decoy = make_cache()
+        marker = decoy / "keep.txt"
+        marker.write_text("keep")
+        try:
+            info = self.root.lstat()
+            os.rmdir(self.root)
+            os.symlink(decoy, self.root)
+            remove_cache(self.root)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(marker.read_text(), "keep")
+            self.assertEqual(decoy.lstat().st_ino, decoy.stat().st_ino)
+            self.assertTrue(self.root.is_symlink())
+            self.assertNotEqual(self.root.lstat().st_ino, info.st_ino)
+        finally:
+            if self.root.is_symlink():
+                self.root.unlink()
+            remove_cache(decoy)
 
 
 if __name__ == "__main__":

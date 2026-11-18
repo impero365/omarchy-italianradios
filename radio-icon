@@ -5,7 +5,8 @@ The panel never loads a directory icon URL itself. Each HTTP or HTTPS image is
 resolved and refused when any answer is private, local, or locally routed.
 The connection uses the address that passed that check. A redirect is fetched
 only when its target passes the same check. The cached file is a PNG, JPEG,
-WebP, GIF, or ICO.
+WebP, GIF, or ICO. Logos the current directory no longer uses are removed,
+and the icon directory stays within CACHE_MAX_BYTES.
 """
 
 import hashlib
@@ -16,8 +17,10 @@ import json
 import os
 import re
 import ssl
+import stat
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -30,8 +33,12 @@ FETCH_WORKERS = 8
 FETCH_TIMEOUT = 4
 BLOCK_TTL = 24 * 60 * 60
 READ_LIMIT = 4_000_000
+# The live directory is a few hundred small logos. The cap stops a changing
+# directory from keeping every logo it has ever seen.
+CACHE_MAX_BYTES = 64 * 1024 * 1024
 ICON_NAME = re.compile(r"^[a-f0-9]{64}\.(png|jpe?g|gif|webp|ico)$")
 REDIRECTS = {301, 302, 303, 307, 308}
+SKIPPED = object()
 
 
 def load_proxy():
@@ -293,7 +300,77 @@ def remember(state, state_path, url, filename):
     write_state(state_path, state)
 
 
-def fetch_one(url, icons_dir, fetch):
+class ByteBudget:
+    """Bytes still available under the icon-directory cap."""
+
+    def __init__(self, remaining):
+        self.remaining = max(0, remaining)
+        self.lock = threading.Lock()
+
+    def reserve(self, size):
+        with self.lock:
+            if size > self.remaining:
+                return False
+            self.remaining -= size
+            return True
+
+    def release(self, size):
+        with self.lock:
+            self.remaining += size
+
+
+def trim_cache(state, icons_dir, wanted):
+    """Drop logos the current directory no longer uses, then the oldest files past the cap."""
+    changed = False
+    for url in list(state["icons"]):
+        if url not in wanted:
+            del state["icons"][url]
+            changed = True
+    for url in list(state["blocked"]):
+        if url not in wanted:
+            del state["blocked"][url]
+            changed = True
+
+    keep = {}
+    for url, name in state["icons"].items():
+        keep.setdefault(name, []).append(url)
+
+    kept = []
+    total = 0
+    with os.scandir(icons_dir) as scan:
+        for entry in scan:
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            referenced = stat.S_ISREG(info.st_mode) and entry.name in keep
+            if not referenced:
+                if stat.S_ISDIR(info.st_mode):
+                    continue
+                try:
+                    os.unlink(entry.path)
+                except OSError:
+                    continue
+                changed = True
+                continue
+            kept.append((info.st_mtime, entry.name, info.st_size))
+            total += info.st_size
+
+    kept.sort()
+    while total > CACHE_MAX_BYTES and kept:
+        _mtime, name, size = kept.pop(0)
+        try:
+            os.unlink(os.path.join(icons_dir, name))
+        except OSError:
+            continue
+        for url in keep.get(name, ()):
+            state["icons"].pop(url, None)
+        total -= size
+        changed = True
+    return changed, max(0, total)
+
+
+def fetch_one(url, icons_dir, fetch, budget):
     try:
         _kind, body = fetch(url)
         ext = sniff(body)
@@ -303,8 +380,14 @@ def fetch_one(url, icons_dir, fetch):
         return url, ""
     except FetchFailed:
         return url, None
+    if not budget.reserve(len(body)):
+        return url, SKIPPED
     filename = hashlib.sha256(url.encode("utf-8")).hexdigest() + "." + ext
-    atomic_write(os.path.join(icons_dir, filename), body)
+    try:
+        atomic_write(os.path.join(icons_dir, filename), body)
+    except Exception:
+        budget.release(len(body))
+        raise
     return url, filename
 
 
@@ -316,7 +399,7 @@ def sync(cache, urls, fetch=fetch_bytes):
     os.chmod(icons_dir, 0o700)
     state_path = os.path.join(cache, "icons.json")
     state = load_state(state_path)
-    pending = []
+    wanted = []
     seen = set()
     for url in urls:
         if url in seen or len(seen) >= MAX_URLS:
@@ -326,6 +409,12 @@ def sync(cache, urls, fetch=fetch_bytes):
             parse_icon_url(url)
         except IconDenied:
             continue
+        wanted.append(url)
+    changed, used = trim_cache(state, icons_dir, set(wanted))
+    if changed:
+        write_state(state_path, state)
+    pending = []
+    for url in wanted:
         name = state["icons"].get(url)
         if name and os.path.isfile(os.path.join(icons_dir, name)):
             continue
@@ -335,12 +424,13 @@ def sync(cache, urls, fetch=fetch_bytes):
         pending.append(url)
     if not pending:
         return state
+    budget = ByteBudget(CACHE_MAX_BYTES - used)
     workers = min(FETCH_WORKERS, len(pending))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(fetch_one, url, icons_dir, fetch) for url in pending]
+        futures = [pool.submit(fetch_one, url, icons_dir, fetch, budget) for url in pending]
         for done in as_completed(futures):
             url, filename = done.result()
-            if filename is None:
+            if filename is None or filename is SKIPPED:
                 continue
             remember(state, state_path, url, filename)
     return state

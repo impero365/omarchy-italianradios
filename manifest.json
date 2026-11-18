@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "impero365.radio-italia",
   "name": "Italian radios",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "author": "Mattia",
   "description": "Italian web radio streams from the Radio Browser directory",
   "kinds": [
